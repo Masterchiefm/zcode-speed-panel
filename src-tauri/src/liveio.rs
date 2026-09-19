@@ -1943,8 +1943,9 @@ mod tests {
     #[test]
     fn restore_cal_filters_and_recomputes_median() {
         let mut io = LiveIo::new();
-        // 30 越下界、9999 越上界、NaN 非有限 → 拒；500/540 入队得 [600,500,540]
-        let n = io.restore_cal(vec![500.0, 540.0, 30.0, 9999.0, f64::NAN]);
+        // 30 越下界、99999 越上界（两平台 CAL_MAX 上界之上）、NaN 非有限 → 拒；
+        // 500/540 入队得 [先验,500,540]
+        let n = io.restore_cal(vec![500.0, 540.0, 30.0, 99_999.0, f64::NAN]);
         assert_eq!(n, 2);
         assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
         // 空恢复不动状态

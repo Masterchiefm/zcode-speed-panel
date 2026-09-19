@@ -2,7 +2,7 @@
 //!
 //! ## 分层口径（为什么不能按进程直测网络字节）
 //!
-//! 2026-09-18 本机实验（详见 docs/key-rules.md #14）：
+//! 2026-09-18 本机实验（详见 docs/key-rules.md #15）：
 //! - **Winsock 收发字节不进 `GetProcessIoCounters` 的任何计数**（20MB 下载期间
 //!   Read 仅 7.8KB，Write 12MB 是落盘镜像）——进程 IO 计数器只含文件/管道/
 //!   设备，liveio 的流式测速因此天然不受网络污染；
@@ -76,13 +76,15 @@ pub fn sess_bytes_est(uncached_input_tokens: u64, output_tokens: u64) -> (u64, u
 /// 不截断——全部工作区都要能列出（用户明确要求，2026-09-18）
 pub(crate) fn ckpt_rows(states: &HashMap<String, CkptState>) -> Vec<crate::metrics::CkptStat> {
     let mut rows: Vec<crate::metrics::CkptStat> = states
-        .values()
-        .map(|s| crate::metrics::CkptStat {
+        .iter()
+        .map(|(hash, s)| crate::metrics::CkptStat {
             workspace: if s.workspace.is_empty() { "?".into() } else { s.workspace.clone() },
             bytes: s.artifact_bytes,
             recorded_ms: s.recorded_at.unwrap_or(0),
             accepted: s.accepted_hash.is_some(),
             uploading: s.uploading,
+            // 子目录名 = 工作区哈希，前端"打开目录"按它拼路径
+            hash: Some(hash.clone()),
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -92,6 +94,27 @@ pub(crate) fn ckpt_rows(states: &HashMap<String, CkptState>) -> Vec<crate::metri
             .then(b.recorded_ms.cmp(&a.recorded_ms))
     });
     rows
+}
+
+/// 扫描 checkpoints 目录 → (状态, 观测列表)。NetIo 每拍观测与
+/// snapshot_guard 的 apply 留档（先留档再清空，key-rules #16）共用
+pub(crate) fn scan_ckpt_states(base: &std::path::Path) -> (String, Vec<(String, CkptState)>) {
+    let rd = match std::fs::read_dir(base) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ("missing".into(), Vec::new()),
+        // 权限拒绝（如 ACL 封锁）或其他错误：如实上报 blocked
+        Err(_) => return ("blocked".into(), Vec::new()),
+    };
+    let mut obs = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Ok(text) = std::fs::read_to_string(e.path().join("state.json")) {
+            if let Some(st) = parse_ckpt_state(&text) {
+                obs.push((name, st));
+            }
+        }
+    }
+    ("ok".into(), obs)
 }
 
 /// 接口计数器差分（纯函数，可测）：wrap>0 时按模数做回绕差分（Windows
@@ -898,6 +921,7 @@ impl NetIo {
                         recorded_ms: u.get("at").and_then(|x| x.as_i64()).unwrap_or(0),
                         accepted: true,
                         uploading: false,
+                        hash: None, // 持久化 JSON 只存名单字段，无目录名
                     })
                     .collect()
             })
@@ -935,23 +959,7 @@ impl NetIo {
         let Some(home) = crate::metrics::home_dir() else {
             return ("missing".into(), Vec::new());
         };
-        let base = home.join(".zcode").join("v2").join("checkpoints");
-        let rd = match std::fs::read_dir(&base) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ("missing".into(), Vec::new()),
-            // 权限拒绝（如 ACL 封锁）或其他错误：如实上报 blocked
-            Err(_) => return ("blocked".into(), Vec::new()),
-        };
-        let mut obs = Vec::new();
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Ok(text) = std::fs::read_to_string(e.path().join("state.json")) {
-                if let Some(st) = parse_ckpt_state(&text) {
-                    obs.push((name, st));
-                }
-            }
-        }
-        ("ok".into(), obs)
+        scan_ckpt_states(&home.join(".zcode").join("v2").join("checkpoints"))
     }
 
     /// 差分事件 → 当日累计 + 调试日志事件（工作区实况列表由 `ckpt_rows`
@@ -970,6 +978,7 @@ impl NetIo {
                         recorded_ms: ev.recorded_ms,
                         accepted: true,
                         uploading: false,
+                        hash: None, // 今日名单按工作区记，不掺目录名
                     });
                     while self.today_uploads.len() > 100 {
                         self.today_uploads.remove(0);

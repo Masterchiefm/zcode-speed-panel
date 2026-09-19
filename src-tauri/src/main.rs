@@ -3,10 +3,11 @@
 mod liveio;
 mod metrics;
 mod netio;
+mod snapshot_guard;
 mod updater;
 
 use liveio::{LiveIo, RoundDrift};
-use metrics::{home_dir, Engine, Snapshot};
+use metrics::{home_dir, Engine, ModelStatsPayload, Snapshot};
 use updater::Release;
 use std::fs;
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WindowEvent};
 
 /// 窗口显示模式：完整面板 / 悬浮窗
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,6 +90,8 @@ struct AppState {
     live: Mutex<LiveIo>,
     /// 网络流量监控（netio.rs：整机接口计数 + 连接归属 + 快照上传证据）
     net: Mutex<netio::NetIo>,
+    /// 快照防护（snapshot_guard.rs：chflags 目录不可变锁，随 poller 每拍更新）
+    guard: Mutex<snapshot_guard::SnapshotGuard>,
     debug: Mutex<DebugLog>,
     persist: Mutex<Persisted>,
     /// 位置落盘节流（拖动期间每 2s 一次，关闭/退出立即落盘）
@@ -100,6 +103,8 @@ struct AppState {
     /// mac 启动引导提示是否待领取（一次性）：setup 在事件循环前执行，
     /// 此时 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取
     tray_hint_pending: Mutex<bool>,
+    /// macOS 无边框多屏安全最大化记忆：(还原物理坐标, 还原物理尺寸)
+    saved_max_rect: Mutex<Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>>,
     /// 当前轮（门控"进行中"连续段）显示速度累计：(Σtps, 实测拍数, 是否见过多进程聚合拍)
     round_tps: Mutex<(f64, u32, bool)>,
     /// 上一拍是否有进行中调用（true→false 沿 = 一轮结束，结算均值喂漂移检测）
@@ -326,13 +331,25 @@ fn clamp_to_screen(window: &tauri::WebviewWindow, x: i32, y: i32, w: u32, h: u32
     (x.clamp(mp.x, max_x), y.clamp(mp.y, max_y))
 }
 
+
 fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted, pet_extra: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
     match mode {
         Mode::Full => {
             let _ = window.set_min_size(Some(LogicalSize::new(720.0, 520.0)));
             let _ = window.set_size(LogicalSize::new(FULL_SIZE.0, FULL_SIZE.1));
-            // 无边框：顶栏为前端自绘（拖动/双击最大化/— ▢ ✕），不再恢复系统装饰
+            // 顶栏：mac 恢复原生 Overlay 标题栏——**真·系统交通灯**（红关/黄最小化/
+            // 绿全屏原生动画），内容延伸到标题栏下，前端给左侧留位；同时切到
+            // Regular 策略亮出 Dock 图标（只有 Regular 应用能原生全屏，见 setup
+            // 注释）。Windows 维持无边框 + 前端自绘 — ▢ ✕（悬浮窗必须无边框）
+            #[cfg(target_os = "macos")]
+            {
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Regular);
+                let _ = window.set_decorations(true);
+            }
+            #[cfg(not(target_os = "macos"))]
             let _ = window.set_decorations(false);
             let _ = window.set_resizable(true);
             let _ = window.set_always_on_top(false);
@@ -364,6 +381,12 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &
             let _ = window.set_min_size(None::<LogicalSize<f64>>);
             let _ = window.set_size(LogicalSize::new(w, h));
             let _ = window.set_decorations(false);
+            // mac：收回 Accessory——藏 Dock 图标回菜单栏常驻（应用不退出，
+            // 与 Regular 亮出 Dock 的完整面板互为两态，见 setup 注释）
+            #[cfg(target_os = "macos")]
+            let _ = window
+                .app_handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory);
             let _ = window.set_resizable(false);
             // 悬浮窗：置顶、不占任务栏、无原生阴影（阴影会盖住圆角外透明区）
             let _ = window.set_always_on_top(true);
@@ -391,6 +414,9 @@ fn switch_mode(app: &AppHandle, mode: Mode) {
     let state = app.state::<AppState>();
     let style = *state.style.lock().unwrap();
     let prev = *state.mode.lock().unwrap();
+    if mode == Mode::Float {
+        *state.saved_max_rect.lock().unwrap() = None;
+    }
     // 记住旧模式下窗口的位置（两种模式各自独立记忆）
     if let Some(win) = app.get_webview_window("main") {
         if let Ok(pos) = win.outer_position() {
@@ -430,6 +456,8 @@ struct SnapshotPayload {
     rollout_dir: String,
     mode: String,
     float_style: String,
+    /// 快照防护状态（每拍附带，前端卡片渲染）
+    guard: snapshot_guard::SnapshotGuardStatus,
 }
 
 fn build_payload(app: &AppHandle) -> SnapshotPayload {
@@ -452,6 +480,9 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     // 实时实测：进程 IO 写字节流（真实值）。多任务并发（多窗口/子代理）时
     // 按进行中会话的归属进程并集聚合，当前速度 = 真实总吞吐
     let now_ms = snapshot.now_ms;
+    // 快照防护（snapshot_guard.rs）：锁定探测 + blocked_rounds 增量累计 +
+    // 节流扫描，随 payload 推送前端卡片
+    let guard_status = state.guard.lock().unwrap().tick(snapshot.calls_today, now_ms);
     // 网络流量监控：整机接口计数差分 + 连接归属 + checkpoint 工件证据
     let net_now = state.net.lock().unwrap().tick(now_ms);
     let net_log_events: Vec<serde_json::Value> = state.net.lock().unwrap().take_events().into_iter().collect();
@@ -736,12 +767,95 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         snapshot,
         mode: mode.as_str().to_string(),
         float_style: style.as_str().to_string(),
+        guard: guard_status,
     }
 }
 
 #[tauri::command]
 fn snapshot(app: AppHandle) -> SnapshotPayload {
     build_payload(&app)
+}
+
+/// 当前 epoch ms（快照防护锁定时刻记录用）
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ---- 快照防护（snapshot_guard.rs）：状态随 metrics payload 每拍附带，
+//      此处三个命令供前端卡片手动查询 / 开启 / 解除（开启与解除的知情
+//      同意确认弹窗在前端 #guard-confirm，见 key-rules #16）----
+
+#[tauri::command]
+fn snapshot_guard_status(app: AppHandle) -> snapshot_guard::SnapshotGuardStatus {
+    let state = app.state::<AppState>();
+    let mut guard = state.guard.lock().unwrap();
+    let calls = guard.last_calls_seen();
+    guard.tick(calls, epoch_ms())
+}
+
+/// 开启防护（前端已过确认弹窗，keep_files = 保留现有快照递归锁 / 删除后锁空目录）
+#[tauri::command]
+fn snapshot_guard_apply(
+    app: AppHandle,
+    keep_files: Option<bool>,
+) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
+    let state = app.state::<AppState>();
+    // 锁定时刻的 calls_today 基线取实时真值（Engine 只读聚合，一次性开销可接受）
+    let calls = state.engine.lock().unwrap().snapshot().calls_today;
+    let result = state
+        .guard
+        .lock()
+        .unwrap()
+        .apply(calls, epoch_ms(), keep_files.unwrap_or(false));
+    result
+}
+
+/// 解除防护：递归解锁（文件不动——删除模式目录本就为空，保留模式快照原地恢复可写）
+#[tauri::command]
+fn snapshot_guard_release(app: AppHandle) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
+    let state = app.state::<AppState>();
+    let calls = state.engine.lock().unwrap().snapshot().calls_today;
+    let result = state.guard.lock().unwrap().release(calls);
+    result
+}
+
+/// 在系统文件管理器中打开某工作区的快照目录（上传记录行的 📂，跨平台：
+/// mac Finder / Windows 资源管理器）。hash 为 checkpoints 下子目录名，
+/// 白名单校验防路径穿越；目录不存在（快照已删除/未生成）如实报错
+#[tauri::command]
+fn open_checkpoint_dir(hash: String) -> Result<(), String> {
+    if !snapshot_guard::valid_hash_name(&hash) {
+        return Err("非法的工作区目录名".into());
+    }
+    let dir = snapshot_guard::checkpoints_dir()
+        .ok_or("无法定位用户目录")?
+        .join(&hash);
+    if !dir.is_dir() {
+        return Err("该工作区的快照目录不存在（快照可能已被删除或尚未生成）".into());
+    }
+    #[cfg(target_os = "macos")]
+    let st = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(target_os = "windows")]
+    let st = std::process::Command::new("explorer").arg(&dir).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = &dir;
+        return Err("仅支持 macOS / Windows".into());
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    st.map(|_| ()).map_err(|e| format!("打开目录失败: {e}"))
+}
+
+/// 模型速度趋势：只读查询 usage 库按模型 × 桶聚合（详情弹窗打开期间前端每 5s 拉取）。
+/// 聚合在 Engine 内现算完成，零本地存储、不写入 usage 库
+#[tauri::command]
+fn model_stats(app: AppHandle, window_min: i64) -> ModelStatsPayload {
+    let state = app.state::<AppState>();
+    let engine = state.engine.lock().unwrap();
+    engine.model_stats(window_min)
 }
 
 #[tauri::command]
@@ -889,6 +1003,68 @@ fn tray_hint_once(app: AppHandle) -> bool {
     let pending = *guard;
     *guard = false;
     pending
+}
+
+fn toggle_window_maximize(window: &tauri::WebviewWindow) {
+    if window.is_maximized().unwrap_or(false) {
+        let _ = window.unmaximize();
+    } else {
+        let _ = window.maximize();
+    }
+}
+
+/// 多屏安全最大化/还原：macOS 无边框窗口原生 toggle_maximize 会跳回主屏，
+/// 此处按窗口中心点所在显示器铺满（避让菜单栏）；Windows 直接调用系统最大化
+#[tauri::command]
+fn toggle_maximize_safe(window: tauri::WebviewWindow, state: tauri::State<'_, AppState>) {
+    #[cfg(windows)]
+    {
+        toggle_window_maximize(&window);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut saved = state.saved_max_rect.lock().unwrap();
+        if let Some((pos, size)) = saved.take() {
+            // 已最大化，执行还原
+            let _ = window.set_size(size);
+            let _ = window.set_position(pos);
+        } else {
+            // 未最大化，执行安全最大化
+            let cur_pos = window.outer_position().unwrap_or_default();
+            let cur_size = window.outer_size().unwrap_or_default();
+            *saved = Some((cur_pos, cur_size));
+
+            let cx = cur_pos.x + cur_size.width as i32 / 2;
+            let cy = cur_pos.y + cur_size.height as i32 / 2;
+            let monitor = window
+                .monitor_from_point(cx as f64, cy as f64)
+                .ok()
+                .flatten()
+                .or_else(|| window.current_monitor().ok().flatten())
+                .or_else(|| window.primary_monitor().ok().flatten());
+
+            if let Some(m) = monitor {
+                let scale = m.scale_factor();
+                let mp = m.position();
+                let ms = m.size();
+                // 避让 macOS 顶部菜单栏高度约 28pt
+                let top_margin = (28.0 * scale) as i32;
+                let target_x = mp.x;
+                let target_y = mp.y + top_margin;
+                let target_w = ms.width;
+                let target_h = ms.height.saturating_sub(top_margin as u32);
+
+                let _ = window.set_position(PhysicalPosition::new(target_x, target_y));
+                let _ = window.set_size(PhysicalSize::new(target_w, target_h));
+            } else {
+                toggle_window_maximize(&window);
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        toggle_window_maximize(&window);
+    }
 }
 
 // ---- 应用内更新（updater.rs）：检查 / 预下载 / 安装编排，事件驱动前端卡片 ----
@@ -1317,12 +1493,14 @@ fn main() {
             style: Mutex::new(FloatStyle::Gauge),
             live: Mutex::new(LiveIo::new()),
             net: Mutex::new(netio::NetIo::new()),
+            guard: Mutex::new(snapshot_guard::SnapshotGuard::new()),
             debug: Mutex::new(DebugLog::new()),
             persist: Mutex::new(Persisted::default()),
             last_pos_save: Mutex::new(None),
             tray_status: Mutex::new(None),
             tray_status_last: Mutex::new(String::new()),
             tray_hint_pending: Mutex::new(cfg!(target_os = "macos")),
+            saved_max_rect: Mutex::new(None),
             round_tps: Mutex::new((0.0, 0, false)),
             round_was_inflight: Mutex::new(false),
             drift: Mutex::new(RoundDrift::new()),
@@ -1333,23 +1511,30 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            model_stats,
             set_mode,
             set_float_style,
             set_float_size,
             quit_app,
+            toggle_maximize_safe,
             recalibrate,
             tray_hint_once,
             check_update,
             install_update,
             app_version,
             export_text_file,
-            open_url
+            open_url,
+            snapshot_guard_status,
+            snapshot_guard_apply,
+            snapshot_guard_release,
+            open_checkpoint_dir
         ])
         .setup(|app| {
-            // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；
-            // 必须在跑起来之前尽早设置（真退出只有托盘"退出"与悬浮窗右键"退出程序"）
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // mac 激活策略**动态切换**（apply_mode 按模式设置，不再固定）：
+            // 完整面板 = Regular（有 Dock 图标——macOS 只把 Regular 应用当
+            // "正经应用"，绿色交通灯才给原生全屏 Space；Accessory 恒为辅助
+            // 全屏：铺满但菜单栏还在，2026-09-19 实测定论）；收起悬浮窗 =
+            // Accessory（藏 Dock 回菜单栏常驻，应用不退出）
 
             // mac：自定义应用菜单拦截 Cmd+Q 为"折叠为悬浮窗"（不注册系统
             // 退出项），并附编辑菜单保住 WebView 的 Cmd+C/V/X/A 快捷键

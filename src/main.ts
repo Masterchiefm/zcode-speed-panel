@@ -3,12 +3,16 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtBps, fmtBytes, fmtClock, fmtDayClock, fmtTokens, fmtTps, speedColor } from "./gauges";
 import { PetWidget } from "./pet";
 import { startMock, type CkptStat, type ConnStat, type Snapshot } from "./mock";
+import { initModelStats } from "./model_stats";
+import { initGuard, renderGuard, type GuardStatus } from "./guard";
 
 interface SnapshotPayload {
   snapshot: Snapshot;
   rolloutDir: string;
   mode: string;
   floatStyle: string;
+  /** 快照防护状态（后端 snapshot_guard.rs；mock 模式无此字段 → 卡片隐藏） */
+  guard?: GuardStatus;
 }
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -18,6 +22,11 @@ const $ = <T extends HTMLElement>(id: string): T => {
 };
 
 const hasTauri = typeof (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ !== "undefined";
+
+const isMac = navigator.userAgent.includes("Mac");
+if (isMac) {
+  document.body.classList.add("platform-mac");
+}
 
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | undefined> {
   if (!hasTauri) return undefined;
@@ -215,7 +224,7 @@ function renderNet(s: Snapshot) {
   netSessUpEl.textContent = fmtBytes(s.netSessUpToday);
   netSessDownEl.textContent = fmtBytes(s.netSessDownToday);
   netCkptEl.textContent = fmtBytes(s.netCkptToday);
-  netCkptCountEl.textContent = s.netCkptTodayCount > 0 ? `（${s.netCkptTodayCount} 个工件）` : "";
+  netCkptCountEl.textContent = s.netCkptTodayCount > 0 ? `（${s.netCkptTodayCount} 个）` : "";
   netUpTodayEl.textContent = fmtBytes(s.netUpToday);
   netDownTodayEl.textContent = fmtBytes(s.netDownToday);
 
@@ -235,9 +244,45 @@ function renderNet(s: Snapshot) {
       : "ZCode 桌面端进程当前无外连";
   }
 
-  // 快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏。
-  // 今日有量时状态行下方逐行列出工作区名单（不去重折叠），悬停看逐条明细
-  if (s.netCkptUploading) {
+  // 快照上传状态行：防护锁定 > 上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏。
+  // 防护开启时目录已清空，不可能有"上传中"；今日量是防护开启前的真实历史。
+  // 今日有量时状态行下方逐行列出工作区名单（不去重折叠，上游 v0.4.1 交互），
+  // 悬停看逐条明细——防护中同样列名单（都是防护开启前发生的真实上传）
+  const renderTodayNames = (todayList: CkptStat[]) => {
+    netCkptNames.textContent = "";
+    netCkptNames.hidden = todayList.length === 0;
+    // 按工作区聚合今日快照（件数 >1 时附件数与字节小计），最新越近排越前；
+    // 回补扫描顺序不保证按时间，取组内最大 recordedMs 当"最新"
+    const byWs = new Map<string, CkptStat[]>();
+    for (const r of todayList) {
+      const k = r.workspace || "?";
+      const arr = byWs.get(k);
+      if (arr) arr.push(r);
+      else byWs.set(k, [r]);
+    }
+    const lastMs = (rows: CkptStat[]) => Math.max(...rows.map((r) => r.recordedMs));
+    const groups = [...byWs.entries()].sort((a, b) => lastMs(b[1]) - lastMs(a[1]));
+    for (const [ws, rows] of groups) {
+      const line = document.createElement("div");
+      line.className = "net-ckpt-name";
+      const bytes = rows.reduce((t, r) => t + r.bytes, 0);
+      line.textContent = `${ws} · ${rows.length > 1 ? `${rows.length} 个 · ` : ""}${fmtBytes(bytes)}`;
+      line.title = rows
+        .map((r) => `${fmtDayClock(r.recordedMs)} · ${fmtBytes(r.bytes)}`)
+        .join("\n");
+      netCkptNames.append(line);
+    }
+  };
+  if (s.guard?.locked) {
+    netCkptInfo.hidden = false;
+    netCkptInfo.classList.remove("uploading");
+    netCkptText.textContent =
+      s.netCkptToday > 0
+        ? `🔒 防护已开启 · 新快照落盘被阻断（今日防护前已上传 ${fmtBytes(s.netCkptToday)} · ${s.netCkptTodayCount} 个）`
+        : "🔒 防护已开启 · 新快照落盘被阻断";
+    netCkptInfo.title = "";
+    renderTodayNames(s.netCkptTodayList ?? []);
+  } else if (s.netCkptUploading) {
     netCkptInfo.hidden = false;
     netCkptInfo.classList.add("uploading");
     netCkptText.textContent = "⬆ 快照上传进行中——工作区内容正整包加密上传";
@@ -254,49 +299,30 @@ function renderNet(s: Snapshot) {
   } else {
     netCkptInfo.hidden = s.netCkptToday === 0;
     netCkptInfo.classList.remove("uploading");
-    netCkptText.textContent = `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
-    // 工作区名单：按工作区聚合今日工件（件数 >1 时附件数与字节小计），
-    // 该工作区最新工件越近排越前；每行悬停看该工作区今日逐条明细
+    netCkptText.textContent = `今日快照上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
     const todayList: CkptStat[] = s.netCkptTodayList ?? [];
-    const byWs = new Map<string, CkptStat[]>();
-    for (const r of todayList) {
-      const k = r.workspace || "?";
-      const arr = byWs.get(k);
-      if (arr) arr.push(r);
-      else byWs.set(k, [r]);
-    }
-    netCkptNames.textContent = "";
-    netCkptNames.hidden = todayList.length === 0;
-    // 回补扫描顺序不保证按时间，取组内最大 recordedMs 当"最新"
-    const lastMs = (rows: CkptStat[]) => Math.max(...rows.map((r) => r.recordedMs));
-    const groups = [...byWs.entries()].sort((a, b) => lastMs(b[1]) - lastMs(a[1]));
-    for (const [ws, rows] of groups) {
-      const line = document.createElement("div");
-      line.className = "net-ckpt-name";
-      const bytes = rows.reduce((t, r) => t + r.bytes, 0);
-      line.textContent = `${ws} · ${rows.length > 1 ? `${rows.length} 个 · ` : ""}${fmtBytes(bytes)}`;
-      line.title = rows
-        .map((r) => `${fmtDayClock(r.recordedMs)} · ${fmtBytes(r.bytes)}`)
-        .join("\n");
-      netCkptNames.append(line);
-    }
+    renderTodayNames(todayList);
     netCkptInfo.title = todayList.length
-      ? `今日已接受的快照工件（${todayList.length} 个）：\n${todayList
+      ? `今日已成功上传的加密快照（${todayList.length} 个）：\n${todayList
           .map((r) => `${fmtDayClock(r.recordedMs)} · ${r.workspace || "?"} · ${fmtBytes(r.bytes)}`)
           .join("\n")}`
       : "";
   }
   netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
 
-  // 快照上传记录：每工作区最近一次工件（时间 / 工作区 / 加密后大小 / 状态），
+  // 快照上传记录：每工作区最近一次快照（时间 / 工作区 / 加密后大小 / 状态），
   // 上传中 > 待传 > 已接受排序（后端排好）。固定显示 5 行，其余列表内滚动
-  // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）
+  // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）。
+  // 行尾 📂 = 在系统文件管理器中打开该快照目录（mac Finder / Win 资源管理器，
+  // 跨平台；只有磁盘上真实存在的行才有——留档历史行没有）。
+  // 列表为空时右栏不能整块消失（防护清空目录后曾变 70% 空白）：
+  // 防护中给锁横幅（保留/删除两态）+ 留档历史；平时给"暂无记录"占位
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
   netCkptList.textContent = "";
-  netCkptListHead.style.display = ckptRows.length > 0 ? "" : "none";
-  for (const r of ckptRows) {
+  netCkptListHead.style.display = "";
+  const appendRow = (r: CkptStat, cls: string, stText: string) => {
     const row = document.createElement("div");
-    row.className = r.uploading ? "ckpt-row uploading" : r.accepted ? "ckpt-row" : "ckpt-row pending";
+    row.className = cls;
     const time = document.createElement("span");
     time.className = "ckpt-time";
     time.textContent = fmtDayClock(r.recordedMs);
@@ -308,9 +334,55 @@ function renderNet(s: Snapshot) {
     size.textContent = fmtBytes(r.bytes);
     const st = document.createElement("span");
     st.className = "ckpt-st";
-    st.textContent = r.uploading ? "上传中 ⬆" : r.accepted ? "已接受 ✓" : "待传";
+    st.textContent = stText;
     row.append(time, ws, size, st);
+    if (r.hash) {
+      const open = document.createElement("button");
+      open.className = "ckpt-open";
+      open.type = "button";
+      open.textContent = "📂";
+      open.title = "在文件管理器中打开该工作区的快照目录（~/.zcode/v2/checkpoints）";
+      open.addEventListener("click", () => {
+        tauriInvoke("open_checkpoint_dir", { hash: r.hash }).catch((err: unknown) => {
+          open.textContent = "⚠️";
+          open.title = `打开失败：${err}`;
+          window.setTimeout(() => {
+            open.textContent = "📂";
+          }, 2500);
+        });
+      });
+      row.append(open);
+    }
     netCkptList.append(row);
+  };
+  if (ckptRows.length > 0) {
+    for (const r of ckptRows) {
+      appendRow(r, r.uploading ? "ckpt-row uploading" : r.accepted ? "ckpt-row" : "ckpt-row pending",
+        r.uploading ? "上传中 ⬆" : r.accepted ? "已接受 ✓" : "待传");
+    }
+    if (s.guard?.locked) {
+      // 保留模式：快照还在（递归锁，只读可扫），行照常显示且可点开——
+      // 横幅说明状态即可，不挡内容
+      const banner = document.createElement("div");
+      banner.className = "ckpt-empty locked";
+      banner.textContent = "🔒 防护已开启 · 以下快照已锁定保留（只读），ZCode 无法写入新快照";
+      netCkptList.prepend(banner);
+    }
+  } else if (s.guard?.locked) {
+    const banner = document.createElement("div");
+    banner.className = "ckpt-empty locked";
+    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定。以下为防护前的原上传记录";
+    netCkptList.append(banner);
+    // 防护前留档（apply 清空前保存）；旧版本未留档时退回今日已上传名单
+    const history: CkptStat[] = s.guard.history?.length ? s.guard.history : s.netCkptTodayList ?? [];
+    for (const r of history) {
+      appendRow(r, "ckpt-row history", r.uploading ? "待传" : "已上传 ✓");
+    }
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "ckpt-empty";
+    empty.textContent = "暂无快照记录（ZCode 未生成过工作区快照）";
+    netCkptList.append(empty);
   }
   lastCkptReport = buildCkptReport(s);
   netScope.textContent = s.netConnsAvailable ? "整机 = 本机全部应用流量（非仅 ZCode）" : "整机 = 本机全部应用流量";
@@ -324,7 +396,7 @@ function buildCkptReport(s: Snapshot): string {
   const now = new Date();
   const p = (x: number) => x.toString().padStart(2, "0");
   lines.push(`ZCode 快照上传记录 · 导出于 ${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}`);
-  lines.push("口径：每工作区最近一次工件（~/.zcode/v2/checkpoints/*/state.json）；大小为加密压缩后字节；状态 = 上传中/待传/已接受");
+  lines.push("口径：每工作区最近一次快照（~/.zcode/v2/checkpoints/*/state.json）；大小为加密压缩后字节；状态 = 上传中/待传/已接受");
   lines.push("");
   lines.push("时间          工作区                       大小         状态");
   lines.push("------------  ---------------------------  -----------  --------");
@@ -334,8 +406,19 @@ function buildCkptReport(s: Snapshot): string {
       `${fmtDayClock(r.recordedMs).padEnd(12)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes).padEnd(11)}  ${st}`,
     );
   }
+  // 防护前留档（apply 清空前保存）——防护中磁盘扫描为空，取证报告仍要
+  // 能看到完整的原上传记录
+  if (s.guard?.locked && s.guard.history?.length) {
+    lines.push("");
+    lines.push(`防护前原上传记录（清空快照前留档，共 ${s.guard.history.length} 条）：`);
+    for (const r of s.guard.history) {
+      lines.push(
+        `${fmtDayClock(r.recordedMs).padEnd(12)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes).padEnd(11)}  防护前`,
+      );
+    }
+  }
   lines.push("");
-  lines.push(`今日快照工件上传：${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`);
+  lines.push(`今日快照上传：${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`);
   for (const r of s.netCkptTodayList ?? []) {
     lines.push(`  ${fmtDayClock(r.recordedMs)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes)}`);
   }
@@ -834,14 +917,16 @@ for (const id of ["float-gauge", "float-pill"]) {
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
 $("app-header").addEventListener("dblclick", (e) => {
   if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
-  if (hasTauri) currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
+  if (hasTauri) tauriInvoke("toggle_maximize_safe").catch(() => {});
 });
 if (hasTauri) {
   $("wc-min").addEventListener("click", () => {
     currentWindow().then((w) => w.minimize()).catch(() => {});
   });
   $("wc-max").addEventListener("click", () => {
-    currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
+    // mac 用原生 Overlay 标题栏（真交通灯，绿点=原生全屏），此按钮已隐藏；
+    // Windows ▢ = 安全最大化（与双击顶栏同款）
+    tauriInvoke("toggle_maximize_safe").catch(() => {});
   });
   $("wc-close").addEventListener("click", () => requestMode("float"));
 } else {
@@ -851,11 +936,18 @@ if (hasTauri) {
 
 applyStyleUi(localStorage.getItem("floatStyle") ?? "gauge");
 
+// ---- 模型速度趋势详情弹窗（图表卡片"模型详情"入口；复用同一个 tauriInvoke） ----
+initModelStats(tauriInvoke);
+
+// ---- 快照防护卡片（网络监控卡下方；状态随 metrics payload 的 guard 字段推送） ----
+initGuard(tauriInvoke);
+
 if (hasTauri) {
   (async () => {
     const { listen } = await import("@tauri-apps/api/event");
     await listen<SnapshotPayload>("metrics", (e) => {
-      onSnapshot({ ...e.payload.snapshot, rolloutDir: e.payload.rolloutDir });
+      onSnapshot({ ...e.payload.snapshot, rolloutDir: e.payload.rolloutDir, guard: e.payload.guard });
+      renderGuard(e.payload.guard ?? null);
     });
     await listen<string>("mode", (e) => applyModeUi(e.payload));
     await listen("tray-hint", () => showTrayHint());
@@ -873,7 +965,8 @@ if (hasTauri) {
         localStorage.setItem("floatStyle", p.floatStyle);
         applyStyleUi(p.floatStyle);
       }
-      onSnapshot({ ...p.snapshot, rolloutDir: p.rolloutDir });
+      onSnapshot({ ...p.snapshot, rolloutDir: p.rolloutDir, guard: p.guard });
+      renderGuard(p.guard ?? null);
     }
     // mac 启动引导（一次性）：页面就绪后主动领取，避免 setup 内 emit 早于加载被丢弃
     if (await tauriInvoke<boolean>("tray_hint_once")) showTrayHint();

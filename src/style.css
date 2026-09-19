@@ -75,6 +75,17 @@ header {
   color: #fff;
 }
 
+/* mac：原生 Overlay 标题栏（真·系统交通灯：红关/黄最小化/绿全屏，原生
+   悬停符号与动画）。自绘控制组整体隐藏；顶栏左侧留位避让原生灯
+  （三灯约占左上 78×28pt，2026-09-19 起不再自绘仿品） */
+body.platform-mac #win-controls {
+  display: none;
+}
+
+body.platform-mac #app-header {
+  padding-left: 82px;
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -82,6 +93,7 @@ header {
   font-size: 16px;
   font-weight: 600;
   letter-spacing: 0.3px;
+  margin-right: auto;
 }
 
 .logo {
@@ -173,11 +185,12 @@ main {
 }
 
 /* 当前速度卡右上角的"上一轮调用速度"小圆环：小而独立，不占主表布局；
-   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角） */
+   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角）。
+   inset 与左上角 ⟳ 按钮（8/8）呼应平衡，不贴卡片边缘 */
 .gauge-card canvas.corner-gauge {
   position: absolute;
-  top: 6px;
-  right: 8px;
+  top: 8px;
+  right: 10px;
   width: 56px;
   height: 56px;
 }
@@ -564,6 +577,59 @@ main {
   font-weight: 600;
 }
 
+/* 行尾"打开快照目录"按钮（mac Finder / Win 资源管理器；仅磁盘上真实
+   存在的行渲染——留档历史行没有 hash 不出按钮） */
+.ckpt-open {
+  flex: none;
+  margin-left: 2px;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 18px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.ckpt-open:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  color: var(--text);
+}
+
+/* 弹窗里的破坏性确认按钮（删除快照并锁定）——红字红框与普通确认区分 */
+.ghost-btn.danger-btn {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #f87171;
+}
+
+.ghost-btn.danger-btn:hover {
+  border-color: rgba(248, 113, 113, 0.8);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+/* 防护开启后的历史行（今日防护前已上传的工件）：整体压暗，与实时记录区分 */
+.ckpt-row.history {
+  opacity: 0.62;
+}
+
+/* 列表空态占位：防护中 = 锁横幅（琥珀），平时 = 灰字提示。
+   没有它右栏会整块消失，网络卡右侧变成大片空白 */
+.ckpt-empty {
+  color: var(--dim);
+  font-size: 12px;
+  text-align: center;
+  padding: 14px 6px;
+}
+
+.ckpt-empty.locked {
+  color: #fbbf24;
+  padding: 8px 6px;
+  border: 1px dashed rgba(251, 191, 36, 0.35);
+  border-radius: 6px;
+  text-align: left;
+}
+
 footer {
   display: flex;
   gap: 18px;
@@ -810,11 +876,12 @@ body.float-mode.style-pill #float-pill {
   height: 100%;
 }
 
-/* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小） */
+/* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小）；
+   top/right 对称留白，不贴窗边（原 right:4 太靠边） */
 .float-badge {
   position: absolute;
-  top: 6px;
-  right: 4px;
+  top: 8px;
+  right: 8px;
   width: 46px;
   height: 46px;
 }
@@ -949,6 +1016,442 @@ body.float-mode #tray-hint {
   border-left: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(13, 20, 36, 0.95);
   transform: rotate(45deg);
+}
+
+/* ---- 模型速度趋势详情弹窗 ---- */
+
+/* 图表卡片标题右侧：峰值 + 模型详情入口按钮 */
+.chart-head-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+#model-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 8, 16, 0.55);
+}
+
+#model-modal-box {
+  width: 90%;
+  max-width: 760px;
+  max-height: 80vh;
+  overflow: auto;
+  padding: 14px 18px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+/* ---- 应用内更新：footer 最右的版本号是检查入口，更新卡片与轻提示在其上方 ---- */
+
+#st-version {
+  margin-left: auto; /* footer 为 flex：把版本号推到整行最右 */
+  margin-right: -6px; /* 视觉上贴住 footer 右缘（补偿点击热区 padding） */
+  padding: 1px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+#st-version:hover {
+  color: var(--cyan);
+}
+
+#st-version.checking::before {
+  content: "↻ ";
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 用户关过提示、但该新版本还没处理：版本号旁挂小圆点持续提醒 */
+#st-version.has-update::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+
+#update-card {
+  display: none;
+  position: fixed;
+  right: 20px;
+  bottom: 46px; /* footer 状态栏上方 */
+  z-index: 110;
+  width: 320px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+
+#update-card.show {
+  display: block;
+}
+
+.update-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-head b {
+  color: var(--cyan);
+}
+
+#update-close {
+  all: unset;
+  cursor: pointer;
+  color: var(--dim);
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+
+#update-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.update-sub {
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+#update-link {
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+#update-link:hover {
+  text-decoration: underline;
+}
+
+.update-notes {
+  margin-top: 8px;
+  max-height: 108px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+  font-family: inherit;
+  user-select: text;
+}
+
+.update-notes:empty {
+  display: none;
+}
+
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.update-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.update-bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #22d3ee, #0ea5e9);
+  transition: width 0.2s;
+}
+
+#update-progress-text {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 108px;
+  text-align: right;
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap; /* 错误信息较长时允许折行，不挤爆按钮 */
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#update-status {
+  color: var(--dim);
+}
+
+#update-status.error {
+  color: #f87171;
+}
+
+#update-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 46px;
+  z-index: 115;
+  padding: 8px 14px;
+}
+
+.model-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.model-modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-right: auto;
+}
+
+/* 图例：一行彩色圆点 + 模型短名，可换行 */
+#model-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 10px 0 4px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* 图例 chips：自绘按钮（key-rules #8——勾选/开关一律自绘），点击切换模型显隐；
+   选中 = 亮色描边 + 色点，未选中 = 灰暗降透明 + 名字删除线 */
+.model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.model-chip:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.model-chip.on {
+  color: var(--text);
+  border-color: rgba(34, 211, 238, 0.55);
+  background: rgba(34, 211, 238, 0.08);
+}
+
+.model-chip:not(.on) {
+  opacity: 0.55;
+}
+
+.model-chip:not(.on) .model-chip-name {
+  text-decoration: line-through;
+}
+
+/* 图例行尾操作：全选 / 仅 Top3（小文字按钮） */
+.model-legend-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.model-legend-tools button {
+  all: unset;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--cyan);
+}
+
+.model-legend-tools button:hover {
+  text-decoration: underline;
+}
+
+.model-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+}
+
+#model-chart-wrap {
+  position: relative;
+}
+
+#model-chart {
+  width: 100%;
+  height: 260px;
+  display: block;
+}
+
+/* 空状态：图表区域居中提示（display 由 JS 按有无数据在 none/flex 间切换） */
+#model-empty {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+/* 图下方每模型一行统计条（横向 flex，可换行） */
+#model-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.model-stat-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.model-stat-row span:last-child {
+  color: var(--text);
+}
+
+/* 悬浮窗/桌宠模式窗口过小放不下弹窗：直接隐藏（JS 侧会同时停掉 5s 轮询） */
+body.float-mode #model-modal {
+  display: none !important;
+}
+
+/* ---- 快照防护卡片（guard.ts，网络监控卡下方）与确认弹窗 ---- */
+
+.guard-card .guard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  padding: 10px 4px 2px;
+}
+
+.guard-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* 状态徽标：未防护灰暗，已防护绿色描边（用户可一瞥确认防护在位） */
+.guard-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.guard-badge.on {
+  color: #34d399;
+  border-color: rgba(52, 211, 153, 0.55);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.guard-stats {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.guard-msg {
+  color: var(--dim);
+}
+
+.guard-msg.error {
+  color: #f87171;
+}
+
+.guard-note {
+  line-height: 1.6;
+}
+
+/* 确认弹窗：复用模型详情弹窗的遮罩 + 卡片风格（开启/解除的知情同意） */
+#guard-confirm {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 95;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 8, 16, 0.55);
+}
+
+#guard-confirm-box {
+  width: min(480px, 90%);
+  padding: 14px 18px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.guard-confirm-text {
+  margin: 12px 0 4px;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.7;
+}
+
+/* 要点行必须是块级文本流：句内 <b> 加粗段会换行回流。曾用 flex 摆 bullet，
+   把 span/b 拆成不换行的独立子项、长句互相挤压错位（用户看到的"乱码"） */
+.guard-confirm-text p {
+  margin: 6px 0;
+  padding-left: 13px;
+  position: relative;
+}
+
+.guard-confirm-text p::before {
+  content: "•";
+  color: var(--dim);
+  position: absolute;
+  left: 0;
+}
+
+.guard-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 12px;
 }
 
 /* ---- 应用内更新：footer 最右的版本号是检查入口，更新卡片与轻提示在其上方 ---- */

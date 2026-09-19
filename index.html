@@ -35,12 +35,12 @@
             title="桌宠气泡常驻显示两行（实时速度 / 上轮均速），待机时也显示，无需鼠标悬停；与桌宠右键菜单里的勾选是同一开关"
           ><span class="pet-chk" aria-hidden="true"></span>常显上轮均速</button>
           <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
-          <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
-            <button id="wc-min" title="最小化">—</button>
-            <button id="wc-max" title="最大化 / 还原">▢</button>
-            <button id="wc-close" title="收起为悬浮窗">✕</button>
-          </span>
         </div>
+        <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
+          <button id="wc-min" title="最小化">—</button>
+          <button id="wc-max" title="全屏 / 还原（mac）· 最大化 / 还原（Windows）">▢</button>
+          <button id="wc-close" title="收起为悬浮窗">✕</button>
+        </span>
       </header>
 
       <main>
@@ -92,7 +92,7 @@
 
         <!-- 网络流量与上传监控：整机接口实测速度 + 会话/非会话上传拆分。
              按进程直测网络字节无公开原语（socket 不进进程 IO 计数、ESTATS 已坏），
-             口径分层：整机=真实 / 快照工件=真实下界 / 会话=token 估算（≈）。
+             口径分层：整机=真实 / 快照上传=真实下界 / 会话=token 估算（≈）。
              双栏布局（左：速度与当日累计 / 右：快照上传记录）控制卡片高度，
              窄窗口（<860px）自动退回单栏 -->
         <section class="card net-card" id="net-card" hidden>
@@ -126,8 +126,8 @@
                 <div class="net-today-row">
                   <span class="net-today-label">今日上传</span>
                   <span class="net-part">会话 ≈<b id="net-sess-up">--</b></span>
-                  <span class="net-part warn" id="net-ckpt-part">快照工件 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
-                  <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入；与旁边的快照工件（按 state.json 接受事件整包计入、当日首启回补）相互独立口径">整机 <b id="net-up-today">--</b></span>
+                  <span class="net-part warn" id="net-ckpt-part">快照上传 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
+                  <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入；与旁边的快照上传（按 state.json 接受事件整包计入、当日首启回补）相互独立口径">整机 <b id="net-up-today">--</b></span>
                 </div>
                 <div class="net-today-row">
                   <span class="net-today-label">今日下载</span>
@@ -154,10 +154,34 @@
           </div>
         </section>
 
+        <!-- 快照防护：阻断 ZCode 工作区快照静默上传（chflags 目录不可变锁，仅 macOS）。
+             状态随 metrics payload 附带推送；开启/解除都必须先过下方确认弹窗
+             （明示损失「检查点回滚 / 时间线」，key-rules #16） -->
+        <section class="card guard-card" id="guard-card" hidden>
+          <div class="chart-head">
+            <span title="防护原理：ZCode 上传工作区快照（整个项目含 .git 历史，加密压缩包）之前，必须先把它写到 ~/.zcode/v2/checkpoints/ 目录。防护 = 清空该目录并加 macOS 不可变标志（chflags uchg），ZCode 从此写不进任何文件——没有本地落盘，就没有东西可上传。全程不碰网络、不碰进程，模型对话/补全/工具调用不受影响。&#10;&#10;监控边界（如实说明，不打包票）：&#10;① 锁定状态每拍做写入探测——锁被意外/人为解除会立即显示「未防护」；&#10;② 已知机制下 ZCode 写不进目录，新快照恒为 0（「防护后 N 轮 · 0 新快照」即阻断证据）；&#10;③ 整机上传速度监控独立兜底——若 ZCode 将来改用不经本地落盘的直传，文件锁拦不住它，只能靠流量异常（无对话时上传飙升）发现；mac 无按进程的连接归属，分辨不了是哪个进程在传。&#10;结论：已知上传机制（先落盘再上传）可确定阻断并留痕；换新机制的偷传无法事前阻止，只能靠流量层发现异常。">快照防护（工作区快照静默上传）</span>
+            <span class="dim" id="guard-scope">chflags 不可变锁 · 可逆</span>
+          </div>
+          <div class="guard-body">
+            <div class="guard-row">
+              <span id="guard-badge" class="guard-badge">🔓 未防护</span>
+              <button id="guard-apply" class="ghost-btn accent-btn" type="button">开启防护</button>
+              <button id="guard-release" class="ghost-btn" type="button" hidden>解除防护</button>
+              <span id="guard-msg" class="guard-msg"></span>
+            </div>
+            <div class="guard-stats" id="guard-stats">--</div>
+            <div class="guard-stats" id="guard-rounds" hidden></div>
+            <div class="dim guard-note">ZCode 登录后会将整个工作区（含 .git 历史）加密上传；防护通过文件系统不可变锁阻断其落盘，不碰网络，不影响模型对话/补全/工具调用。代价：损失「检查点回滚 / 时间线」功能；随时可解除（目录会自动重建）。</div>
+          </div>
+        </section>
+
         <section class="card chart-card">
           <div class="chart-head">
             <span>近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
-            <span id="chart-max" class="dim">峰值 0</span>
+            <span class="chart-head-right">
+              <span id="chart-max" class="dim">峰值 0</span>
+              <button id="btn-model-stats" class="ghost-btn" type="button" title="按模型分类的速度趋势与统计（最近 10 分钟 / 1 小时 / 6 小时）">模型详情</button>
+            </span>
           </div>
           <canvas id="spark"></canvas>
         </section>
@@ -219,6 +243,52 @@
 
       <!-- mac 引导提示：应用常驻菜单栏（无 Dock 图标），窗口每次从隐藏到显示时出现，6 秒自动淡出 -->
       <div id="tray-hint" title="点击关闭">应用常驻菜单栏 ↗ 点菜单栏图标可显示面板 / 退出</div>
+
+      <!-- 模型速度趋势详情弹窗：三档时间窗 × 按模型折线与统计（只读查询 usage 库现算，零本地存储） -->
+      <div id="model-modal">
+        <div id="model-modal-box">
+          <div class="model-modal-head">
+            <span class="model-modal-title">模型速度趋势</span>
+            <div id="model-window" class="dropdown" title="统计窗口">
+              <button id="model-window-btn" class="ghost-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+                <span id="model-window-label">最近 1 小时</span>
+                <span class="caret">▾</span>
+              </button>
+              <div id="model-window-list" class="dropdown-list" role="listbox" aria-label="统计窗口">
+                <button type="button" role="option" data-value="10">最近 10 分钟</button>
+                <button type="button" role="option" data-value="60" class="selected">最近 1 小时</button>
+                <button type="button" role="option" data-value="360">最近 6 小时</button>
+              </div>
+            </div>
+            <button id="model-modal-close" class="ghost-btn" type="button" title="关闭">✕</button>
+          </div>
+          <div id="model-legend"></div>
+          <div id="model-chart-wrap">
+            <canvas id="model-chart"></canvas>
+            <div id="model-empty">窗口内暂无调用数据</div>
+          </div>
+          <div id="model-summary"></div>
+        </div>
+      </div>
+
+      <!-- 快照防护确认弹窗：复用 #model-modal 的遮罩+卡片风格。开启必须
+           明示损失「检查点回滚 / 时间线」与"对话不受影响"（用户要求的
+           知情同意，key-rules #15）；文案按动作在 guard.ts 里填充 -->
+      <div id="guard-confirm">
+        <div id="guard-confirm-box">
+          <div class="model-modal-head">
+            <span class="model-modal-title" id="guard-confirm-title">开启快照防护？</span>
+            <button id="guard-confirm-close" class="ghost-btn" type="button" title="关闭">✕</button>
+          </div>
+          <div class="guard-confirm-text" id="guard-confirm-text"></div>
+          <div class="guard-confirm-actions">
+            <!-- apply 模式：二选一（保留并锁定 / 删除并锁定）；release 模式：单个确认 -->
+            <button id="guard-confirm-keep" class="ghost-btn accent-btn" type="button" hidden>保留快照并锁定</button>
+            <button id="guard-confirm-ok" class="ghost-btn accent-btn" type="button">确认开启</button>
+            <button id="guard-confirm-cancel" class="ghost-btn" type="button">取消</button>
+          </div>
+        </div>
+      </div>
 
       <!-- 应用内更新：发现新版本时的提示卡片（右下角，版本号在 footer 最右、点击即检查）；
            下载进度与安装状态都在这张卡上 -->
