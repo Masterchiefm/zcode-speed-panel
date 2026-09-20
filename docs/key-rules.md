@@ -77,13 +77,18 @@
 - **进程扫描 buffer 零分配**：macOS 的 `KERN_PROCARGS2` 必须复用 scratch buffer（64KB），禁止在 PID 循环中分配，避免每轮刷新引发 64MB 堆分配毛刺。
 - **session_pid 随进程存活淘汰**：liveio 维护的会话-PID 映射在进程轮询检测退出时必须调用 `session_pid.retain` 清理，防止多会话长时间运行累积脏数据与 PID 复用误归因。
 
-## 12. 应用内更新：CI 产物命名即匹配协议，且失效是静默的
+## 12. 窗口控制平台原生化与多屏安全最大化（macOS 副屏防跳屏）
+
+- **外观原生化**：macOS 标志性的红黄绿交通灯位于顶栏最左侧（左起：红 `#ff5f56` 折叠悬浮窗、黄 `#ffbd2e` 最小化、绿 `#27c93f` 最大化），悬停显现微小符号（`✕`、`—`、`▢`）；Windows 环境保持右侧 `— ▢ ✕` 自绘按钮不变。前端通过 `navigator.userAgent.includes("Mac")` 为 `body` 注入 `platform-mac` class。
+- **副屏最大化防跳屏（`toggle_maximize_safe`）**：无边框窗口（`decorations:false`）在 macOS 下直接调用系统 `toggleMaximize()` 会因为系统 `zoom:` 动作强行跳回主屏。解决方式为 Rust 端 `toggle_maximize_safe`：取窗口中心点所在显示器（`monitor_from_point`），按该显示器物理尺寸铺满（预留顶部系统菜单栏 28pt 避让高度 `(28.0 * scale) as i32`），并在 `AppState.saved_max_rect` 暂存最大化前的物理矩形；再次触发或双击顶栏时还原；在切换到悬浮窗（`switch_mode(Mode::Float)`）时清空暂存，保证状态干净。
+
+## 13. 应用内更新：CI 产物命名即匹配协议，且失效是静默的
 
 - **产物名即协议**：`updater::pick_asset` 按 Release 资产名后缀匹配本平台安装包：`*_x64-setup.exe`（win-x64，portable 版不参与自动安装）、`*_x64.dmg`（mac-x64）、`*_aarch64.dmg`（mac-aarch64）。改产物命名、加新架构而不同步 `pick_asset` 的后果是**静默的**——检查正常返回但找不到安装包，用户永远收不到更新且没有任何报错（更新模块按设计宁可漏报不打扰，见 updater.rs 模块注释）。改名/加架构必须同一提交内同步 `asset_picking` 测试。
 - **版本号三处同步**：`tauri.conf.json`（运行时权威：`package_info().version` 用于显示与比较）、`Cargo.toml`、`package.json`。发版漏 bump `tauri.conf.json` 时新 Release 的 tag 与旧版本号相等 → 判"已是最新"，更新功能同样静默失效。
 - **GitHub API 必带 User-Agent**（无 UA 直接拒绝）；403 限流与断网同按"无更新"处理。HTTP 客户端为 ureq（同步阻塞 + rustls，无 OpenSSL，mac 交叉构建友好），全部网络操作在后台线程，失败不触碰 UI。
 
-## 13. 多任务并发的实时链路：单选会话、归因盲区/翻转、求和口径都是坑
+## 14. 多任务并发的实时链路：单选会话、归因盲区/翻转、求和口径都是坑
 
 多 CLI 进程并发（多窗口、子代理并行）时实时链路曾经的四个静默缺口（2026-09-18 定位，证据为当日 debuglog：主/子代理调用块、attr_pid 翻转、bpt 262~764 摆动）：
 
@@ -100,7 +105,7 @@
 - **同进程多会话如实合计**：同一 app-server 进程承载的多个会话（同窗口新开任务）在字节层不可拆分——任务行计为一行、`n_sessions` 标注会话数计入任务总数（前端按 Σ会话数 ≥2 触发显示），速度为该进程合计。排查多任务问题直接看 tick 日志的 `pids`（每台被跟踪进程探测窗 KB/s）/`infl`（进行中会话数）/`attr`（会话→pid 映射）三件套，不要只看 npids。
 - 轮漂移只吃**单进程轮**（main.rs `round_tps` 第三位记录 saw_multi，任一实测拍 npids>1 整轮跳过；npids = 窗口内贡献达流式量级的进程数，空闲进程的底噪泄漏不计入）——任务数变化带来的吞吐差不是系数漂移，1 任务 40 t/s 与 3 任务 120 t/s 是同一系数，误触发会把好系数重置回先验。
 
-## 14. 网络字节的平台原语限制：按进程直测无公开原语，口径必须分层
+## 15. 网络字节的平台原语限制：按进程直测无公开原语，口径必须分层
 
 背景：2026-09-17 发现 ZCode 静默上传整仓快照（含 `.git/` 历史，单工件 549MB）到阿里云 OSS，需要流量监控区分会话/非会话上传。2026-09-18 本机实验定论（netio.rs 分层口径的依据）：
 
@@ -112,3 +117,24 @@
 - **"与任务管理器对不上"是口径差异，不是计数 bug**（2026-09-18 用户报告过一次）：① 单位——任务管理器为比特（Mbps/Kbps），面板为字节，×8 才可比；② 范围——任务管理器 Wi-Fi 页仅所选适配器，面板为全部非回环接口求和（虚拟网卡/VPN 隧道流量内外层各计一次）；③ 时间——面板 ~1s 滑窗平均（`NET_WINDOW_MS`，对齐任务管理器刷新节奏），突发被摊平且采样时刻不同。另：整机当日累计只含面板在场时段（重启基线重打、无回补），与按接受事件回补的快照工件口径独立，"工件 GB 级、整机 MB 级"可同时为真。
 
 => 现行方案（netio.rs）：整机接口计数（真实）+ 会话 token 估算（≈）+ checkpoints `state.json` 工件接受事件（真实下界）三层分层，UI 逐项标注口径；连接归属用 `GetExtendedTcpTable`(OWNER_PID) 按进程分组（命令行含 `zcode.cjs` = 会话组，其余 `zcode.exe` = 桌面端非会话组）。**证据链**：整机上传飙升 + 桌面端组新连接 + `activeUpload` = 快照上传现场。守护测试：`wrap_delta_handles_32bit_wrap_and_resets`（回绕/重置钳 0）、`apply_ckpt_obs_counts_acceptance_diffs`（接受差分/跨天去重/回补）、`parse_ckpt_state_fields`。
+
+## 16. 快照防护：chflags 是破坏性动作，知情同意弹窗不可绕过
+
+「开启防护」（snapshot_guard.rs 的 apply）会锁定 `~/.zcode/v2/checkpoints/`（`chflags uchg`），**删除模式还会删除本地全部快照**。用户明确要求的知情同意（改弹窗时缺一不可）：**删除模式五点**——明示损失「检查点回滚 / 时间线」、明示"模型对话/补全/工具调用不受任何影响"、明示删除的快照数量与体积且**原始上传记录会随之消失**、明示**会自动备份上传记录清单但只备份清单**（快照文件等明细不备份、删后不可恢复）、明示可逆；**保留模式**（2026-09-19 新增，弹窗双按钮二选一）——快照原地只读保留、记录可看可点开，不涉"记录消失"，但须明示占用磁盘与只读。后端 apply/release 收到调用即执行、不做二次确认（防弹窗被绕过后语义分裂）；「解除防护」同样过确认弹窗（简短版）。
+- **递归锁机制坑（保留模式的命门，2026-09-19）**：`chflags uchg` 只锁**目录自身的条目表**——已存在的子目录（`checkpoints/<hash>/pending/`）内部仍可写，**只锁根目录挡不住已有工作区写新快照**。保留模式必须 `chflags -R uchg` 递归锁整树；release 必须配套 `-R nouchg`（只解根目录会留下锁死的子树，恢复后 ZCode 写入仍失败且用户看不出原因）。锁定只挡写不挡读——只读扫描（记录列表/统计）在锁定期间照常工作。
+- **不能封网络**：快照上传凭证 API 与模型 API 同域，网络层拦截会打断对话；唯一安全解是文件系统不可变锁（目录写不进 → 快照链路死亡），见 features.md「快照防护」。
+- **锁定判定与幂等**：apply 必须先 `chflags nouchg` 再清空重建（重复开启/目录已锁时直接 remove 会失败）；锁定后用写入探测（create+delete 临时文件失败 = 已锁）校验生效并作为每拍的状态来源——guard.json 只是计数（锁定时刻 + calls 基线 + 累计轮次 + calls_seen 基准），**目录实际状态以探测为准**（外部解锁时 poller 清档如实反映）。
+- **增量计数基准必须落盘（2026-09-18 事故：15 分钟虚增 3412 轮）**：blocked_rounds 按 calls_today 差分累计，但基准只存在内存（`last_calls`）时**重启即归零**，首拍把全天计数整包计入——每重启一次虚增一次。修法：基准 `calls_seen` 持久化进 guard.json，`new()` 恢复，差分走纯函数 `accrue_rounds`（测试 `accrue_rounds_counts_real_delta_only` 守护"重启只算真实增量"）。任何"差分累计"类计数同理：**跨重启的基准要么落盘、要么重扫全量对齐，不能悬在内存里**。
+- **防护与上传记录必须联动（同日二次事故）**：apply 清空 checkpoints 后磁盘扫描必为空——上传记录列表若按"空就整块隐藏"处理，网络卡右栏变 70% 空白（用户以为坏了）。修法：**apply 先留档再清空**（记录行存 `speed-panel-ckpt-history.json`，同工作区新行覆盖、`merge_history` 测试守护），防护中列表回放留档（状态「防护前」）、复制/导出报告含历史节；列表为空给占位，net 状态行 locked 时切 🔒 分支。**"数据源被自己删掉"的 UI 必须先留档、再显式表达因果，不能静默空白**。
+- **UI 文案不许造词（同日用户反馈："不要自己取名字，工件是啥"）**：用户可见文案用平实词（快照/加密快照/项目），内部术语（工件/workspace）只留在代码注释与文档口径里。
+- **确认弹窗文案排版禁用 flex（同日"乱码"事故）**：要点行内嵌 `<b>` 加粗段时，`p{display:flex}` 会把 span/b 拆成不换行的独立子项，长句互相挤压错位、看似乱码。弹窗/文案段落一律块级文本流（bullet 用 `::before` 绝对定位 + padding-left）。
+- **平台如实降级**：chflags 仅 macOS，其他平台卡片显示但按钮禁用 + "文件锁仅支持 macOS"（沿用 netio"连接明细仅 Windows"先例，不假装支持）。
+- 守护测试：`state_summary_parse_and_aggregate`、`guard_status_serializes_locked_fields`（含 guard.json 往返与"未防护不落多余键"）、`accrue_rounds_counts_real_delta_only`。
+
+## 17. mac 窗口全屏/Dock：只信官方身份与默认行为，别跟 AppKit 抠细节（2026-09-19 全屏攻坚定论）
+
+用户要求 mac 绿色交通灯为原生全屏。攻坚过程与教训（一天内多轮实测）：
+
+- **Accessory（菜单栏常驻）应用的窗口永远拿不到原生 Space 全屏**——绿键只给辅助全屏（铺满但菜单栏不隐藏）。`collectionBehavior=FullScreenPrimary`、窗口改不透明、运行时绑 `toggleFullScreen:` 全部无效。**唯一解 = Regular 应用身份**：完整面板 `set_activation_policy(Regular)`（亮 Dock 图标）+ 原生 Overlay 标题栏，绿键即原生全屏；收起悬浮窗切回 Accessory（藏 Dock、应用不退出），两态动态切换已实装。
+- **裸 objc FFI 三坑**：① Cocoa 属性 getter 无 `get` 前缀（`collectionBehavior`，写 `getCollectionBehavior` → unrecognized selector → **ObjC 异常穿过 Rust extern "C" 直接 abort 进程**，且第一现场 panic 信息被吞，要用 lldb 断 `panic_cannot_unwind`/读 `~/Library/Logs/DiagnosticReports/*.ips` 的 `lastExceptionBacktrace` 定位）；② 同一 `#[link_name="objc_msgSend"]` 声明多个不同签名会告警并存隐患，fn 指针 transmute 在新 rustc 有运行期检查；③ 运行时创建 ObjC 类做按钮 target/action，回调里再调 tauri 窗口 API + `setPresentationOptions:` 会抛 NSException 崩溃（自建"沉浸全屏"方案因此废弃，代码已剥离）。**结论：与 AppKit 交互只用 tauri 公开 API；官方没有的能力（原生全屏）靠换应用身份解决，不硬造。**
+- **窗口实验要能秒回滚**：本轮多组未提交实验靠 `git stash` 一键回到已验证状态；"改完先起 dev 让用户看效果，确认后才 build/push"是固定流程（用户明确要求）。

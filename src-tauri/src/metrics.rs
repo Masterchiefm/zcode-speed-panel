@@ -1,6 +1,6 @@
 use chrono::{Datelike, Local, NaiveTime, Utc};
 use rusqlite::OpenFlags;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -59,21 +59,26 @@ pub struct ConnStat {
     pub proc: String,
 }
 
-/// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**工件实况，
-/// 来自 `~/.zcode/v2/checkpoints/*/state.json`
-#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+/// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**快照实况，
+/// 来自 `~/.zcode/v2/checkpoints/*/state.json`。Deserialize 供防护历史
+/// 文件（speed-panel-ckpt-history.json）读回；hash = checkpoints 下的
+/// 工作区子目录名（点行"打开目录"用；留档旧行没有 → None）
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CkptStat {
     /// 工作区显示名（workspacePath 末段）
     pub workspace: String,
-    /// 最近一次压缩加密工件字节数
+    /// 最近一次压缩加密快照字节数
     pub bytes: u64,
-    /// 工件记录时刻（recordedAt，epoch ms；0 = 未知）
+    /// 快照记录时刻（recordedAt，epoch ms；0 = 未知）
     pub recorded_ms: i64,
-    /// 最近工件已被服务端接受（lastAcceptedManifestHash 非空）
+    /// 最近快照已被服务端接受（lastAcceptedManifestHash 非空）
     pub accepted: bool,
     /// activeUpload 进行中
     pub uploading: bool,
+    /// checkpoints 下的工作区子目录名（哈希）；留档旧行可为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// 推送给前端的指标快照
@@ -575,6 +580,53 @@ impl Engine {
         }
         inflight_from_rows(&cands, Utc::now().timestamp_millis())
     }
+
+    /// 模型速度趋势：只读查询窗口内已完成的 model_usage 行，按模型 × 时间桶聚合。
+    /// 仅查询现算（零本地存储、不给 usage 库建索引/写入）；conn 缺失或查询失败
+    /// 返回空 payload（不 panic）。聚合口径见 aggregate_model_stats
+    pub fn model_stats(&self, window_min: i64) -> ModelStatsPayload {
+        let window_min = clamp_window_min(window_min);
+        let now = now_ms();
+        let Some(conn) = &self.conn else {
+            eprintln!("[zcode-speed-panel] model_stats: usage DB 不可用");
+            return empty_model_stats(window_min, now);
+        };
+        // 注：model_usage 表的模型列实名是 model_id（PRAGMA table_info 核实，无 model 列）
+        let sql = concat!(
+            "SELECT model_id, first_token_at, completed_at, duration_ms, ",
+            "output_tokens, reasoning_tokens FROM model_usage ",
+            "WHERE status='completed' AND completed_at >= ?1 ORDER BY completed_at ASC"
+        );
+        let cutoff = now - window_min * 60_000;
+        let query = || -> rusqlite::Result<Vec<ModelUsageRow>> {
+            let mut stmt = conn.prepare_cached(sql)?;
+            let rows = stmt.query_map([cutoff], |r| {
+                let model: String = r.get(0)?;
+                let ft: Option<i64> = r.get(1)?;
+                let completed: i64 = r.get(2)?;
+                let dur: Option<i64> = r.get(3)?;
+                // rusqlite 不支持 u64 列读取，按 i64 取再转（与 poll 同口径）
+                let out: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                let reason: i64 = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                Ok(ModelUsageRow {
+                    model,
+                    first_token_at: ft,
+                    completed_at: completed,
+                    duration_ms: dur,
+                    output_tokens: out.max(0) as u64,
+                    reasoning_tokens: reason.max(0) as u64,
+                })
+            })?;
+            Ok(rows.flatten().collect())
+        };
+        match query() {
+            Ok(rows) => aggregate_model_stats(rows, window_min, now),
+            Err(e) => {
+                eprintln!("[zcode-speed-panel] model_stats query failed: {e}");
+                empty_model_stats(window_min, now)
+            }
+        }
+    }
 }
 
 /// message 门控纯判定：候选 (会话, assistant 行创建时刻, 是否已带 completed)。
@@ -601,6 +653,175 @@ pub(crate) fn inflight_from_rows(
         .collect();
     out.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     out
+}
+
+// ============ 模型速度趋势（按模型 × 时间桶聚合，详情弹窗用，零本地存储） ============
+
+/// 合法统计窗口（分钟）：最近 10 分钟 / 1 小时 / 6 小时
+const MODEL_WINDOW_CHOICES: [i64; 3] = [10, 60, 360];
+/// 趋势图统一 60 桶（0 = 最新桶）
+const MODEL_BUCKETS: usize = 60;
+
+/// 单模型单桶聚合
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelBucket {
+    /// 该桶 tps = Σ(output+reasoning) ÷ Σ纯生成秒；无调用为 0
+    pub tps: f64,
+    pub calls: u64,
+    pub tokens: u64,
+}
+
+/// 单模型一条趋势线 + 窗口汇总
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSeries {
+    pub model: String,
+    /// 恒 60 个，0 = 最新桶
+    pub buckets: Vec<ModelBucket>,
+    pub total_calls: u64,
+    pub total_tokens: u64,
+    /// 全窗口 Σeff ÷ Σgen_s
+    pub avg_tps: f64,
+    /// 各桶 tps 的最大值
+    pub peak_tps: f64,
+    /// 该模型 eff 占全部模型 eff 比例（0~1）
+    pub share: f64,
+}
+
+/// model_stats 命令的返回载荷
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatsPayload {
+    pub window_min: i64,
+    pub bucket_ms: i64,
+    pub now_ms: i64,
+    /// 按 total_tokens 降序
+    pub series: Vec<ModelSeries>,
+}
+
+/// model_usage 查询行（聚合纯函数的输入）
+struct ModelUsageRow {
+    model: String,
+    first_token_at: Option<i64>,
+    completed_at: i64,
+    duration_ms: Option<i64>,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+}
+
+/// 每模型每桶的原始累计：(有效输出 token, 生成毫秒, 调用数)
+struct BucketAcc {
+    eff: u64,
+    gen_ms: i64,
+    calls: u64,
+}
+
+/// 非法窗口值归入最近的合法档位（10 / 60 / 360 分钟）
+fn clamp_window_min(window_min: i64) -> i64 {
+    MODEL_WINDOW_CHOICES
+        .iter()
+        .copied()
+        .min_by_key(|&w| (w - window_min).abs())
+        .unwrap_or(60)
+}
+
+/// 空 payload（conn 缺失 / 查询失败时返回，不 panic）
+fn empty_model_stats(window_min: i64, now_ms: i64) -> ModelStatsPayload {
+    ModelStatsPayload {
+        window_min,
+        bucket_ms: window_min * 60_000 / MODEL_BUCKETS as i64,
+        now_ms,
+        series: Vec::new(),
+    }
+}
+
+/// 纯函数：把窗口内已完成的调用行聚合成按模型 60 桶的趋势与汇总（便于单测）。
+/// - 桶序号 = (now − completed) ÷ bucket_ms（div_euclid，未来时刻为负直接丢弃），
+///   0 = 最新桶、59 = 最旧桶，越界丢弃；
+/// - gen_ms = completed − first_token，first_token 缺失或非正退 duration_ms，
+///   再 max(50) 兜底（与今日聚合同口径）；
+/// - eff = output + reasoning；桶 tps = Σeff ÷ Σgen_s，无调用为 0；
+/// - series 按 total_tokens 降序。
+fn aggregate_model_stats(
+    rows: Vec<ModelUsageRow>,
+    window_min: i64,
+    now_ms: i64,
+) -> ModelStatsPayload {
+    let window_min = clamp_window_min(window_min);
+    let bucket_ms = window_min * 60_000 / MODEL_BUCKETS as i64;
+    // model -> (每桶累计, 总eff, 总gen_ms, 总调用数)
+    let mut per_model: HashMap<String, (Vec<BucketAcc>, u64, i64, u64)> = HashMap::new();
+    for r in rows {
+        let gen = match r.first_token_at {
+            Some(f) if r.completed_at > f => r.completed_at - f,
+            _ => r.duration_ms.filter(|d| *d > 0).unwrap_or(MIN_DUR_MS),
+        }
+        .max(MIN_DUR_MS);
+        let eff = r.output_tokens + r.reasoning_tokens;
+        let slot = (now_ms - r.completed_at).div_euclid(bucket_ms);
+        if slot < 0 || slot as usize >= MODEL_BUCKETS {
+            continue;
+        }
+        let entry = per_model.entry(r.model).or_insert_with(|| {
+            (
+                (0..MODEL_BUCKETS)
+                    .map(|_| BucketAcc { eff: 0, gen_ms: 0, calls: 0 })
+                    .collect(),
+                0,
+                0,
+                0,
+            )
+        });
+        let b = &mut entry.0[slot as usize];
+        b.eff += eff;
+        b.gen_ms += gen;
+        b.calls += 1;
+        entry.1 += eff;
+        entry.2 += gen;
+        entry.3 += 1;
+    }
+
+    let grand_eff: u64 = per_model.values().map(|e| e.1).sum();
+    let mut series: Vec<ModelSeries> = per_model
+        .into_iter()
+        .map(|(model, (buckets, total_eff, total_gen, total_calls))| {
+            let mut peak = 0.0f64;
+            let buckets: Vec<ModelBucket> = buckets
+                .into_iter()
+                .map(|b| {
+                    let tps = if b.gen_ms > 0 {
+                        b.eff as f64 / (b.gen_ms as f64 / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    if tps > peak {
+                        peak = tps;
+                    }
+                    ModelBucket { tps, calls: b.calls, tokens: b.eff }
+                })
+                .collect();
+            ModelSeries {
+                model,
+                buckets,
+                total_calls,
+                total_tokens: total_eff,
+                avg_tps: if total_gen > 0 {
+                    total_eff as f64 / (total_gen as f64 / 1000.0)
+                } else {
+                    0.0
+                },
+                peak_tps: peak,
+                share: if grand_eff > 0 {
+                    total_eff as f64 / grand_eff as f64
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect();
+    series.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then(a.model.cmp(&b.model)));
+    ModelStatsPayload { window_min, bucket_ms, now_ms, series }
 }
 
 // ============ 测试 ============
@@ -729,5 +950,114 @@ mod tests {
         let s2 = agg.snapshot();
         // 分母用 completed - first_token（不含首 token 前的等待），仍是 100 t/s
         assert!((s2.avg_tps - 100.0).abs() < 1e-9);
+    }
+
+    fn mrow(
+        model: &str,
+        completed: i64,
+        ft: Option<i64>,
+        dur: Option<i64>,
+        out: u64,
+        reason: u64,
+    ) -> ModelUsageRow {
+        ModelUsageRow {
+            model: model.into(),
+            first_token_at: ft,
+            completed_at: completed,
+            duration_ms: dur,
+            output_tokens: out,
+            reasoning_tokens: reason,
+        }
+    }
+
+    /// 两模型 × 两桶：tps/calls/tokens/avg/peak/share 正确、桶对齐、空桶为 0、
+    /// series 按 total_tokens 降序、窗口外（过早/未来）行丢弃
+    #[test]
+    fn model_stats_two_models_two_buckets() {
+        let now = 1_700_000_000_000i64;
+        let rows = vec![
+            // 模型 A：桶 0（gen 4s，eff 400 → 100 t/s）、桶 1（gen 1s，eff 100 → 100 t/s）
+            mrow("model-a", now - 5_000, Some(now - 9_000), Some(9_000), 300, 100),
+            mrow("model-a", now - 15_000, Some(now - 16_000), Some(6_000), 100, 0),
+            // 模型 B：桶 0（首 token 缺失退 duration 2s，eff 400 → 200 t/s）、
+            // 桶 2（gen 3s，eff 1200 → 400 t/s）
+            mrow("model-b", now - 5_000, None, Some(2_000), 400, 0),
+            mrow("model-b", now - 25_000, Some(now - 28_000), None, 900, 300),
+            // 越界：早于窗口（桶 70）与未来时刻（div_euclid 为负），都应丢弃
+            mrow("model-a", now - 700_000, Some(now - 701_000), None, 999, 0),
+            mrow("model-a", now + 1_000, Some(now), None, 999, 0),
+        ];
+        let p = aggregate_model_stats(rows, 10, now);
+        assert_eq!(p.window_min, 10);
+        assert_eq!(p.bucket_ms, 10_000);
+        assert_eq!(p.now_ms, now);
+        // 按 total_tokens 降序：B(1600) 在前，A(500) 在后
+        assert_eq!(p.series.len(), 2);
+        assert_eq!(p.series[0].model, "model-b");
+        assert_eq!(p.series[1].model, "model-a");
+
+        let b = &p.series[0];
+        assert_eq!(b.buckets.len(), 60);
+        assert_eq!(b.total_calls, 2);
+        assert_eq!(b.total_tokens, 1600);
+        assert!((b.avg_tps - 1600.0 / 5.0).abs() < 1e-9); // Σeff 1600 ÷ 5s
+        assert!((b.peak_tps - 400.0).abs() < 1e-9);
+        assert!((b.share - 1600.0 / 2100.0).abs() < 1e-9);
+        assert!((b.buckets[0].tps - 200.0).abs() < 1e-9);
+        assert_eq!(b.buckets[0].calls, 1);
+        assert_eq!(b.buckets[0].tokens, 400);
+        assert_eq!(b.buckets[1].calls, 0); // 空桶
+        assert_eq!(b.buckets[1].tps, 0.0);
+        assert_eq!(b.buckets[1].tokens, 0);
+        assert!((b.buckets[2].tps - 400.0).abs() < 1e-9);
+        assert_eq!(b.buckets[2].tokens, 1200);
+        // 越界行未计入任何桶
+        assert_eq!(b.buckets.iter().map(|x| x.calls).sum::<u64>(), 2);
+
+        let a = &p.series[1];
+        assert_eq!(a.total_calls, 2);
+        assert_eq!(a.total_tokens, 500);
+        assert!((a.avg_tps - 100.0).abs() < 1e-9); // 500 ÷ 5s
+        assert!((a.peak_tps - 100.0).abs() < 1e-9);
+        assert!((a.share - 500.0 / 2100.0).abs() < 1e-9);
+        assert!((a.buckets[0].tps - 100.0).abs() < 1e-9);
+        assert!((a.buckets[1].tps - 100.0).abs() < 1e-9);
+        assert_eq!(a.buckets[2].calls, 0);
+    }
+
+    /// 窗口 clamp（999→360、0→10、40→60、400→360）与 gen_ms 缺失退化
+    /// （first_token None → duration_ms → max(50) 兜底）
+    #[test]
+    fn model_stats_window_clamp_and_gen_fallback() {
+        assert_eq!(clamp_window_min(999), 360);
+        assert_eq!(clamp_window_min(0), 10);
+        assert_eq!(clamp_window_min(40), 60);
+        assert_eq!(clamp_window_min(400), 360);
+        assert_eq!(clamp_window_min(60), 60);
+        assert_eq!(clamp_window_min(360), 360);
+
+        let now = 1_700_000_000_000i64;
+        let rows = vec![
+            mrow("m", now - 5_000, None, Some(5_000), 500, 0), // gen=5000ms
+            mrow("m", now - 6_000, None, None, 100, 0),        // duration 缺失 → 50ms
+            mrow("m", now - 7_000, Some(now - 7_000), Some(0), 100, 0), // ft 非正（=completed）→ dur 0 非正 → 50ms
+        ];
+        // window_min=999 归入 360（6 小时）：桶宽 360_000ms，三行都落最新桶
+        let p = aggregate_model_stats(rows, 999, now);
+        assert_eq!(p.window_min, 360);
+        assert_eq!(p.bucket_ms, 360_000);
+        assert_eq!(p.series.len(), 1);
+        let s = &p.series[0];
+        assert_eq!(s.buckets.len(), 60);
+        assert_eq!(s.total_calls, 3);
+        assert_eq!(s.total_tokens, 700);
+        // Σeff 700 ÷ (5s + 50ms + 50ms)
+        assert!((s.avg_tps - 700.0 / 5.1).abs() < 1e-9);
+        assert!((s.buckets[0].tps - 700.0 / 5.1).abs() < 1e-9);
+        assert_eq!(s.peak_tps, s.buckets[0].tps);
+        assert!((s.share - 1.0).abs() < 1e-9);
+        // 空输入 → 空 series
+        let p = aggregate_model_stats(Vec::new(), 10, now);
+        assert!(p.series.is_empty());
     }
 }

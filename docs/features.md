@@ -50,7 +50,7 @@
 
 ### 为什么是分层口径（平台限制）
 
-**Windows 非管理员下没有"按进程的网络收发字节"公开原语**，2026-09-18 本机实验定论（详见 key-rules #14）：
+**Windows 非管理员下没有"按进程的网络收发字节"公开原语**，2026-09-18 本机实验定论（详见 key-rules #15）：
 
 - Winsock 收发字节**不进** `GetProcessIoCounters` 的任何计数（20MB 下载期间 Read 仅 7.8KB）——进程 IO 计数器只含文件/管道/设备，liveio 的流式测速因此天然不受网络污染；
 - TCP ESTATS（`Set/GetPerTcpConnectionEStats`，唯一的每连接字节 API）不可用——2026-09-18 复验归档（`python scripts/estats_probe.py`，build 26200、普通权限）：v4/v6 共 4 个导出符号都存在，但 `Set`（启用 Data 采集）对自有/他人连接一律 `ERROR_ACCESS_DENIED`(5)（启用需特权、与连接归属无关），未启用时 `Get` 恒失败（`ERROR_INVALID_USER_BUFFER`(1784) 居多、个别连接 `ERROR_NOT_SUPPORTED`(50)），调用姿势变体（Get 附 Rw / Set 附 Rod 缓冲）无效；
@@ -101,6 +101,31 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 
 每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。**两组连接不显示各自的速度**：按进程网络字节在非管理员下无公开原语（见上"平台限制"，ESTATS 已复验定论），真实速度只有整机层可测。
 
+## 快照防护（snapshot_guard.rs + src/guard.ts）
+
+完整面板"网络流量与上传监控"卡下方的独立卡片：**阻断 ZCode 工作区快照的静默上传**。
+
+- **机制**：ZCode 登录后会把整个工作区（含 `.git/` 全历史）打成加密 tar.gz 写入 `~/.zcode/v2/checkpoints/<工作区hash>/pending/*.tar.gz.enc`，经 zcode.z.ai 拿凭证直传阿里云 OSS；设置开关无效，凭证 API 与模型 API 同域**不能封网络**（2026-09 本机验证，[机制分析文章](https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/)）。防护 = `chflags uchg` 不可变锁（macOS 用户级，无需 sudo）——ZCode 写不进去，快照链路死亡。**不碰网络、不碰进程**，对运行中的 ZCode 无侵入。
+- **两种开启模式**（确认弹窗二选一，2026-09-19）：
+  - **保留并锁定**（推荐）：现有快照**原地保留（加密、只读）**，**递归锁整棵树**（`chflags -R uchg`）——必须递归：uchg 只锁目录自身的条目表，只锁根目录挡不住已存在子目录内的写入（key-rules #16）。上传记录照常实时显示、行尾 📂 可打开快照目录；
+  - **删除并锁定**：先留档记录清单再清空全部快照，重建空目录后锁根目录——原始上传记录随之消失（仅剩留档），确认弹窗明示。
+  - 共同代价：损失**「检查点回滚 / 时间线」**（state.json 无法更新）；对话/补全/工具调用不受影响；随时解除（保留模式快照原地恢复可写，删除模式空目录由 ZCode 自动重建）。
+- **卡片口径**：
+  - 状态徽标 🔒 已防护（绿色描边）/ 🔓 未防护，由**写入探测**判定（在目录里 create+delete 临时文件，创建失败 = 已锁；目录不存在 = 未锁）；
+  - 数据行三态：未防护 = `本地已积累加密快照 N 个 · X · 覆盖 M 个项目 · 上传失败 K 次`（N = `**/pending/*.enc` 逐文件实测，K = 各 `state.json` 的 `failureCount` 求和；扫描 5s 节流，**保留模式锁定后只读扫描照常工作**）；防护中·快照已保留 = `防护生效中（快照已保留）：N 个只读锁定（共 X）…`；防护中·快照已删除 = `防护生效中（快照已删除）：目录已清空并锁定…（留档 N 条可回看）`；
+  - 防护中追加 `防护开启后 P 轮对话 · 新快照落盘 0 个`——P 为锁定后的对话轮次：锁定时刻的 `calls_today` 基线存 `~/.zcode/speed-panel-guard.json`，poller 每拍按 calls 增量累计并落盘。**增量基准 `calls_seen` 同样落盘并在启动时恢复**（只存内存时重启归零，首拍把全天计数整包计入——实测 15 分钟虚增至 3412；差分走纯函数 `accrue_rounds`，跨天回退按 0 增量重置基准拍）；目录已锁但 guard.json 无记录（用户手动 chflags / 重装面板）时首拍补记基线。
+- **与上传记录联动**：
+  - 网络卡"快照上传记录"行尾 **📂 按钮**：在系统文件管理器中打开该工作区的快照目录（`open_checkpoint_dir` 命令，mac `open` / Windows `explorer`，**跨平台**；目录名经 `valid_hash_name` 白名单校验防路径穿越，目录不存在如实报错）。只有磁盘上真实存在的行（实时扫描）才渲染——留档历史行没有 hash 不出按钮；
+  - 防护中：保留模式横幅 `🔒 以下快照已锁定保留（只读）` + 实时行照常显示且可点开；删除模式（扫描为空）= 🔒 锁横幅 + **防护前留档行**（`~/.zcode/speed-panel-ckpt-history.json`，状态「已上传 ✓」整体压暗，旧版本未留档时退回今日名单）；平时列表空 = "暂无快照记录"灰字——右栏任何状态不静默空白；
+  - net 状态行（`net-ckpt-info`）locked 时切 🔒 分支：`防护已开启 · 新快照落盘被阻断`，今日量标注"防护前"（防护开启后不可能再有"上传中"脉冲）；
+  - 复制/导出报告在防护中（删除模式）追加「防护前原上传记录」节（取证仍完整）。
+- **先留档再清空（删除模式）**：apply 删除 checkpoints 前，把当时的上传记录行（每工作区最近一次快照，复用 netio 的解析与行构建，口径与实时列表一致）合并存入 ckpt-history.json——同工作区新行覆盖旧行、按时刻倒序、上限 500 行（`merge_history` 纯函数，测试守护）；重复开启/解除再开启不丢历史。保留模式不写留档（记录未销毁）。
+- **防护原理与监控边界 hover**：卡片标题悬停展示机制说明（先落盘再上传 → 锁目录 = 断链路）+ 如实声明监控边界（锁状态每拍探测 / 已知机制下 0 新快照为阻断证据 / 整机流量兜底但 mac 无按进程归属，换直传机制只能靠流量异常发现）——不承诺 100% 拦截。
+- **术语**：用户可见文案统一「快照 / 加密快照」，不用内部黑话「工件」（2026-09-18 用户反馈"不要自己取名字"）。
+- **命令**：`snapshot_guard_status` / `snapshot_guard_apply(keepFiles)` / `snapshot_guard_release` / `open_checkpoint_dir(hash)`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply(keep=true) = 递归 uchg（快照保留）；apply(keep=false) = 留档 → 清空 → 重建 → uchg 根目录；release = **递归 nouchg**（兼容保留模式的整树锁）+ 清空计数，**文件一律不动**。**确认弹窗在前端**（`#guard-confirm`）——双模式按钮：「保留快照并锁定」（主按钮）/「删除快照并锁定」（红色 danger 样式）；删除模式的五点知情同意缺一不可：损失检查点回滚 / 对话不受影响 / 原始上传记录随之消失 / 自动备份仅清单（快照文件等明细删后不可恢复）/ 可逆（key-rules #16）。
+- **平台**：`chflags` 仅 macOS——其他平台卡片仍显示但按钮禁用、标题右侧标注"文件锁仅支持 macOS"（沿用连接明细"仅 Windows"的如实降级先例）。**📂 打开目录是独立命令，Windows 同样可用**（记录列表本身跨平台）。
+- **守护测试**：`state_summary_parse_and_aggregate`（failureCount 求和 / 快照体积累计 / 损坏容错）、`guard_status_serializes_locked_fields`（状态字段 camelCase 序列化契约 + guard.json 往返）、`accrue_rounds_counts_real_delta_only`、`merge_history_replaces_same_workspace_keeps_rest`、`valid_hash_name_rejects_traversal`（路径穿越拒绝）。
+
 ## 仪表与曲线（gauges.ts）
 
 - **当前速度表**：最小量程 60 t/s（`minScale` 可按表覆盖）；卡片左上角有 **⟳ 重新校准按钮**（口径见"实时速度"节），与右上角"上轮"角标呼应；**平均速度表**：最小 10 t/s；**今日总量表**：最小量程 1 亿 token，超峰值后自动放大（1亿→2亿→5亿→…），回落缓慢收缩。
@@ -108,6 +133,17 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - **当前速度表分档配色**（`gauges.ts` 顶部 `SPEED_TIERS`，主表、迷你仪表与角标小表共用）：背景轨道恒灰，整条进度弧随当前速度所在档**整体**换色——六档全覆盖（部分极速模型远超 100 t/s，故上限开放）：0–40 绿 `#34d399` / 40–80 黄绿 `#a3e635` / 80–160 黄 `#fbbf24` / 160–240 橙 `#fb923c` / 240–320 红 `#f87171` / 320+ 品红 `#e879f9`，大数字同步变色；待机（0）数字保持默认白，估算态仍为琥珀 ≈，不走分档。
 - 量程跟随峰值平滑变化（峰值上涨立即放大、回落指数收敛），估算时指针/弧线变琥珀色并加 ≈；**启动期（is_starting）数字显示 "…" 并以青色短弧呼吸脉冲**（已连接、等待首字节），不走分档色。
 - **15 分钟速度曲线**：后端 90 桶 × 10s（对齐墙钟边界），前端按 `nowMs % 10s` 相位连续左移；横轴标注**真实墙钟时刻**（每 5 分钟整分刻度 + 右缘当前时刻），可与数据直接对表。
+
+## 模型速度趋势详情（metrics.rs `model_stats` + src/model_stats.ts）
+
+- **入口**：图表卡片右上角"模型详情"按钮 → 居中深色弹窗（`#model-modal`，与悬浮窗菜单同风格）；✕、Esc、点击弹窗内容之外均可关闭，收起为悬浮窗时弹窗隐藏并停止轮询。
+- **三档统计窗口**（弹窗标题旁自绘下拉，默认最近 1 小时）：最近 10 分钟 / 1 小时 / 6 小时；非法的 `window_min` 在后端归入最近的合法档位（10/60/360）。
+- **桶粒度**：统一 60 桶，`bucket_ms = 窗口 ÷ 60`（10min→10s、1h→60s、6h→360s）；桶序号 = `(now − completed_at) ÷ bucket_ms`（0 = 最新桶、59 = 最旧，越界丢弃）；无调用的桶 tps = 0。
+- **每模型曲线**：桶 tps = Σ(output+reasoning) ÷ Σ纯生成秒；gen_ms 口径与全局一致（`completed_at − first_token_at`，first_token 缺失或非正退 `duration_ms`，下限 50ms）。y 轴 0~峰值×1.15 自适应（3 条横网格线 + 刻度），x 轴 5 个真实墙钟刻度（HH:MM）；折线配色按序取 8 色调色板循环，图例中模型名超 18 字符截断加 …（完整名放 title）。
+- **每模型统计条**：模型名 + `均速（全窗口 Σeff ÷ Σgen_s）· 峰值（各桶 tps 最大值）· 调用次数 · token（=Σeff，附占比 = 该模型 eff ÷ 全部模型 eff）`；series 按 total_tokens 降序排列。
+- **图例 chips 多选**：图例每模型一个自绘 chip（色点 + 名字，深色按钮风格），点击切换该模型显隐——折线与底部统计行同步过滤，chip 配色取模型在完整列表中的原始序号（隐藏再显示颜色不变）；**至少保留一个**：全取消时自动回到全选。图例行尾有「全选」「仅 Top3」（按 total_tokens 前三，模型不足 3 个时等价全选）两个小文字按钮。选中集合持久化在 localStorage（`modelStats.visible.v1`，存可见模型名数组；查不到 / 模型已全部不存在时回退全选；5s 轮询刷新期间选中集合在内存保持，新出现的模型默认可见，不被旧存档静默隐藏）。
+- **数据源与零存储**：直接只读查询 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表（`status='completed' AND completed_at >= now − 窗口`），Rust 现算聚合、内存缓存最近一次结果；**不给该库建索引/写入，也不新增任何本地存储**。前端仅在弹窗打开期间每 5s `invoke("model_stats", { windowMin })` 拉取，关闭即 clearInterval。
+- **测试**：`aggregate_model_stats` 为纯函数（`metrics.rs`），两模型两桶聚合、窗口 clamp 与 gen_ms 退化各有单测守护。
 
 ## 悬浮窗与桌宠
 
@@ -122,12 +158,16 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 
 ## 窗口与托盘
 
-- **无边框窗口**（`decorations:false`，透明窗口在 mac 走 `macos-private-api` + `macOSPrivateApi`）+ 自绘顶栏（左侧为应用图标 `app-icon.png`）：`#app-header` 带原生 `data-tauri-drag-region`，空白处拖动由内核处理，子元素经 enableDrag 冒泡拖动（二者互斥，按钮/输入/`.dropdown` 不参与）；双击顶栏最大化/还原。
-- 顶栏控制：**— 最小化**（`core:window:allow-minimize`）、**▢ 最大化/还原**（`allow-toggle-maximize`）、**✕ = 收起为悬浮窗**（不是退出；完全退出走托盘菜单或悬浮窗右键菜单）。
+- **无边框窗口**（`decorations:false`，透明窗口在 mac 走 `macos-private-api` + `macOSPrivateApi`）+ 自绘顶栏（应用图标 `app-icon.png`）：`#app-header` 带原生 `data-tauri-drag-region`，空白处拖动由内核处理，子元素经 enableDrag 冒泡拖动（二者互斥，按钮/输入/`.dropdown` 不参与）；双击顶栏安全最大化/还原。
+- 顶栏控制平台原生化：
+  - **macOS**：控制按钮移至顶栏最左侧，为原生交通灯圆点（左起依次为：红 `#ff5f56` 收起为悬浮窗、黄 `#ffbd2e` 最小化、绿 `#27c93f` **原生全屏**，2026-09-19 按 mac 语言惯例调整——原生全屏在所在屏进出、无副屏跳屏问题；"铺满当前屏"仍走双击顶栏的安全最大化），平时半透明纯色圆点，鼠标悬停控制区时显现微小符号（`✕`、`—`、`▢`）；
+  - **Windows**：保持顶栏最右侧自绘 `— 最小化`、`▢ 最大化`、`✕ 收起为悬浮窗` 风格不变。
+  - 完全退出走托盘菜单或悬浮窗右键菜单。
+- **多屏安全最大化（`toggle_maximize_safe`）**：macOS 无边框窗口调用系统 `toggleMaximize()` 会触发系统 `zoom:` 回退到主屏跳屏。后端通过 `toggle_maximize_safe` 计算窗口中心点所在显示器（`monitor_from_point`）铺满（避让顶部菜单栏 28pt），并记忆还原物理矩形；再次调用或双击顶栏安全还原至原副屏位置和尺寸；折叠为悬浮窗时清理暂存。
 - 托盘：左键单击显示/隐藏；右键菜单**顶部为实时状态行**（disabled 不可点，poller 每拍按快照更新：生成中 `x.x t/s` / 估算中 `≈x.x t/s` / 待机；文本变化才写入，托盘 tooltip 同步为 `ZCode 速度仪表盘 · 状态`），其后是菜单项（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）。重复启动唤起已有窗口（single-instance 插件）。
 - 窗口标题实时同步当前速度（任务栏/Alt+Tab 可见）。
 - **mac 差异**：
-  - 应用为 **Accessory 模式**（`set_activation_policy`，setup 内尽早调用）：无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘。
+  - **Dock 两态（动态激活策略，2026-09-19）**：完整面板 = **Regular**（`apply_mode` 切换）——亮出 Dock 图标、进 Cmd+Tab，且只有 Regular 应用身份的窗口绿键才给**原生 Space 全屏**（Accessory 恒为辅助全屏：铺满但菜单栏不隐藏，实测定论）；收起悬浮窗/桌宠 = **Accessory**——Dock 图标自动隐藏、回菜单栏常驻，应用不退出。
   - 自定义应用菜单：`Cmd+Q` 被拦截为"隐藏为悬浮窗"（菜单中**不含任何系统退出项**，保证退出只走托盘与悬浮窗右键）；附"编辑" submenu（cut/copy/paste/select_all）保住 WebView 的 Cmd+C/V/X/A。
   - 退出兜底：`RunEvent::ExitRequested { code: None }` 一律 `prevent_exit` + 保存 + 折叠为悬浮窗（真退出 `app.exit(0)` 时 code=Some 放行，`RunEvent::Exit` 再保存一次）。**真退出只有托盘菜单"退出"与悬浮窗右键"退出程序"两条路**。
   - **引导提示**：前端右上角显示"应用常驻菜单栏 ↗ 点菜单栏图标可显示面板 / 退出"（深色半透明、顶部小箭头指向菜单栏），6 秒自动淡出、点击立即关闭；**仅完整面板模式显示**（悬浮窗/桌宠窗口过小会被裁剪，CSS 按 `body.float-mode` 门控）。触发时机两条：① 启动——setup 阶段早于 WKWebView 加载、emit 发即被弃，改为前端初始化完成后 `invoke("tray_hint_once")` 领取一次性标志（AppState 的 `tray_hint_pending`，mac 初始 true、领取即清零，非 mac 恒 false）；② 托盘"显示面板"/左键 toggle 唤起隐藏窗口（`show_main`，页面已就绪，直接 emit `tray-hint`）。Windows 两条路径都不触发，前端永不显示。
@@ -145,6 +185,8 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 | `~/.zcode/speed-panel-mode.txt` | JSON：mode/style/full_pos/float_pos/pet_size（旧格式纯文本兼容） |
 | `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
 | `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down/ckpt/ckpt_count + 当日已接受工件名单 uploads，跨天清零；见"网络流量与上传监控"节） |
+| `~/.zcode/speed-panel-guard.json` | 快照防护状态（lockedSinceMs/callsBaseline/blockedRounds/callsSeen 增量基准，未防护时不落多余键；见"快照防护"节） |
+| `~/.zcode/speed-panel-ckpt-history.json` | 防护前的原上传记录留档（apply 清空前写入，同工作区新行覆盖，上限 500 行；防护期间列表/报告回看） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
 ## 应用内更新（updater.rs）
