@@ -1,20 +1,20 @@
-//! 快照防护：阻断 ZCode 工作区快照的静默上传（chflags uchg 目录不可变锁）。
+//! 快照防护：阻断 ZCode 工作区快照的静默上传（目录写入锁，双平台）。
 //!
 //! ## 背景（2026-09 本机验证）
 //!
 //! ZCode 登录后会把**整个工作区**（含 `.git/` 全历史）打成加密 tar.gz 写入
 //! `~/.zcode/v2/checkpoints/<工作区hash>/pending/*.tar.gz.enc`，再经
 //! zcode.z.ai 拿凭证直传阿里云 OSS；设置开关无效，且凭证 API 与模型 API
-//! 同域，**不能靠封网络解决**。清空该目录后对目录本身 `chflags uchg`
-//! （macOS 用户级不可变标志，用户自有目录无需 sudo）即可让 ZCode 写不进
-//! 去——快照链路死亡，而模型对话/补全/工具调用完全正常；唯一损失是
-//! 「检查点回滚 / 时间线」。`chflags nouchg` 随时可逆，目录留空时 ZCode
-//! 会自动重建内容。（机制来源：ferster 博客《ZCode 静默上传工作区快照》）
+//! 同域，**不能靠封网络解决**。让 ZCode 写不进该目录——快照链路死亡，
+//! 而模型对话/补全/工具调用完全正常；唯一损失是「检查点回滚 / 时间线」。
+//! 锁随时可逆，目录留空时 ZCode 会自动重建内容。（机制来源：ferster 博客
+//! 《ZCode 静默上传工作区快照》）
 //!
 //! ## 实现要点
 //!
-//! - **不碰网络、不碰进程**：只做目录文件系统操作（remove/create/chflags，
-//!   `std::process::Command` 调系统 chflags），对运行中的 ZCode 无侵入；
+//! - **不碰网络、不碰进程**：只做目录文件系统操作（remove/create/锁定，
+//!   `std::process::Command` 调系统命令：mac chflags / win icacls），
+//!   对运行中的 ZCode 无侵入；
 //! - **锁定检测 = 写入探测**：在目录里 create+delete 临时文件，创建失败
 //!   即已锁。纯 std 实现，比解析 `ls -lO` / libc `st_flags` 干净；
 //! - **知情同意在前端**（`#guard-confirm` 确认弹窗必须明示损失检查点回滚，
@@ -24,21 +24,23 @@
 //!   `blocked_rounds`，**基准 calls_seen 一并落盘**——否则重启后内存
 //!   last_calls 归零，首拍会把全天计数整包计入（实测 15 分钟虚增至 3412）；
 //!   跨天回退按 0 增量重置基准拍；
-//! - **目录已锁但无记录**（用户看过文档后手动 chflags / 重装面板）：首拍
+//! - **目录已锁但无记录**（用户看过文档后手动锁 / 重装面板）：首拍
 //!   探测到即补记基线，从该时刻起算轮次；
 //! - **先留档再清空**：apply 删除 checkpoints 前把当时的上传记录行
 //!   （每工作区最近一次快照）存入 `~/.zcode/speed-panel-ckpt-history.json`，
 //!   防护期间前端可完整回看「防护前的原上传记录」（用户明确要求，
 //!   2026-09-18）；重复开启按工作区合并（新记录覆盖同工作区旧行）；
-//! - **仅 macOS**：Windows 无等价的用户级不可变标志，`supported=false`，
+//! - **平台锁机制**（详见 `set_immutable` 与 key-rules #16）：macOS
+//!   `chflags uchg` 不可变标志；Windows NTFS 拒绝 ACE（icacls 对当前
+//!   用户 SID 拒绝创建/写入，拒绝优先于允许）。其他平台 `supported=false`，
 //!   apply/release 返回中文错误，前端按钮禁用并如实标注。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// chflags 仅 macOS（其他平台 apply/release 拒绝执行）
-pub const SUPPORTED: bool = cfg!(target_os = "macos");
+/// 目录写入锁双平台（mac chflags / win icacls；其他平台 apply/release 拒绝执行）
+pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// checkpoints 目录扫描节流（poller ~700ms 一拍，不必每拍走文件系统）
 const SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -47,7 +49,7 @@ const SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotGuardStatus {
-    /// 本平台是否支持文件锁（chflags 仅 macOS；false 时前端禁用按钮）
+    /// 本平台是否支持目录写入锁（mac chflags / win icacls；false 时前端禁用按钮）
     pub supported: bool,
     /// checkpoints 目录当前是否被锁定（写入探测失败）
     pub locked: bool,
@@ -216,26 +218,94 @@ fn save_guard_file(f: &GuardFile) {
     }
 }
 
-/// chflags uchg/nouchg（std::process::Command，用户自有目录无需 sudo）。
-/// 仅在 SUPPORTED 平台被调用。recursive = 连同子目录/文件整树上锁
-/// （保留模式必须递归：uchg 只管目录自身的条目表，只锁根目录挡不住
-/// 已存在工作区子目录内的写入，见 key-rules #16）
+/// 目录写入锁，按平台分流（仅在 SUPPORTED 平台被调用）：
+/// - macOS：`chflags [-R] uchg/nouchg`（用户级不可变标志，无需 sudo）。
+///   recursive = 连同子目录/文件整树上锁（保留模式必须递归：uchg 只管
+///   目录自身的条目表，只锁根目录挡不住已存在工作区子目录内的写入，
+///   见 key-rules #16）；
+/// - Windows：NTFS 无用户级不可变标志，等价物是目录**拒绝 ACE**
+///   （`icacls /deny *<SID>:(OI)(CI)(WD,AD)`）——拒绝优先于一切允许，
+///   当前用户在此树内创建/写入一律被拒、读取不受影响；(OI)(CI) 可继承
+///   ACE 由系统自动传播到已存在的整棵子树（含锁定前就在的工作区子目录，
+///   等价 mac 的 -R 递归），recursive 无需分流。解除 = `/remove:d`
+///   删掉该拒绝 ACE（子树的继承副本随自动继承一并清除）。
+///   **故意不含 D/DC（删除）**：实测（2026-09-20）拒绝 D 后连纯读取都
+///   被拒——以 DELETE 权限打开文件的工具（git-bash 的 POSIX unlink 模拟、
+///   部分编辑器/备份/沙箱层）会整体失败；只拒 WD/AD 即可杀死快照写入
+///   链路（新文件创建与旧文件改写都进不来），见 key-rules #16。
 fn set_immutable(dir: &Path, lock: bool, recursive: bool) -> Result<(), String> {
-    let flag = if lock { "uchg" } else { "nouchg" };
-    let mut cmd = std::process::Command::new("chflags");
-    if recursive {
-        cmd.arg("-R");
-    }
-    let st = cmd
-        .arg(flag)
-        .arg(dir)
-        .status()
-        .map_err(|e| format!("执行 chflags 失败: {e}"))?;
-    if st.success() {
-        Ok(())
+    if cfg!(target_os = "macos") {
+        let flag = if lock { "uchg" } else { "nouchg" };
+        let mut cmd = std::process::Command::new("chflags");
+        if recursive {
+            cmd.arg("-R");
+        }
+        let st = cmd
+            .arg(flag)
+            .arg(dir)
+            .status()
+            .map_err(|e| format!("执行 chflags 失败: {e}"))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("chflags {}{} 未成功（exit {:?}）", if recursive { "-R " } else { "" }, flag, st.code()))
+        }
+    } else if cfg!(windows) {
+        let sid = current_sid()?;
+        let mut cmd = std::process::Command::new("icacls");
+        cmd.arg(dir);
+        if lock {
+            cmd.arg("/deny").arg(format!("*{sid}:(OI)(CI)(WD,AD)"));
+        } else {
+            cmd.arg("/remove:d").arg(format!("*{sid}"));
+        }
+        let st = cmd
+            .status()
+            .map_err(|e| format!("执行 icacls 失败: {e}"))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "icacls {} 未成功（exit {:?}）",
+                if lock { "/deny" } else { "/remove:d" },
+                st.code()
+            ))
+        }
     } else {
-        Err(format!("chflags {}{} 未成功（exit {:?}）", if recursive { "-R " } else { "" }, flag, st.code()))
+        Err("文件锁仅支持 macOS / Windows".into())
     }
+}
+
+/// 当前用户 SID（whoami 解析，进程内缓存）。icacls 拒绝 ACE 必须用 SID
+/// 而不是用户名：Microsoft 账户登录时 %USERNAME% 与 ACL 里的账户主体名
+/// 不一致（moqiq ≠ MicrosoftAccount\email），按名字 deny 会匹配不上
+fn current_sid() -> Result<String, String> {
+    static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    SID.get_or_init(|| {
+        let out = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .map_err(|e| format!("执行 whoami 失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("whoami 未成功（exit {:?}）", out.status.code()));
+        }
+        parse_whoami_sid(&String::from_utf8_lossy(&out.stdout))
+            .ok_or_else(|| "无法从 whoami 输出解析当前用户 SID".to_string())
+    })
+    .clone()
+}
+
+/// `whoami /user /fo csv /nh` 输出 → SID（纯函数，可测）。实测输出形如
+/// `"superdesktop\moqiq","S-1-5-21-…-1001"`（CRLF 行尾，字段带引号）；
+/// 取 S-1- 开头的字段，容忍多余列/空行/引号差异
+pub(crate) fn parse_whoami_sid(csv: &str) -> Option<String> {
+    csv.lines().find_map(|line| {
+        line.split(',').find_map(|f| {
+            let f = f.trim().trim_matches('"');
+            (f.starts_with("S-1-") && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+                .then(|| f.to_string())
+        })
+    })
 }
 
 /// 写入探测：目录存在且无法在其中创建临时文件 = 已锁（uchg 阻止在目录内
@@ -383,11 +453,12 @@ impl SnapshotGuard {
     /// 开启防护（前端已过确认弹窗，keep_files = 用户选择保留/删除现有快照）：
     ///
     /// - **保留模式**（keep_files=true）：上传记录清点后**递归锁定整棵树**
-    ///   （`chflags -R uchg`）——快照文件原地保留（加密、只读），列表仍可
-    ///   查看与打开；记录未销毁，不写历史留档。必须递归：uchg 只管目录自身
-    ///   条目表，只锁根目录挡不住已存在子目录里的写入；
+    ///   （mac `chflags -R uchg` / win 可继承拒绝 ACE 自动传播）——快照文件
+    ///   原地保留（加密、只读），列表仍可查看与打开；记录未销毁，不写历史
+    ///   留档。必须整树锁：mac 只锁根目录挡不住已存在子目录里的写入，
+    ///   win 的 (OI)(CI) 继承同样覆盖整棵子树；
     /// - **删除模式**（keep_files=false）：**先留档再清空**（上传记录行合并
-    ///   进 ckpt-history.json，防护期间可回看）→ 重建空目录 → uchg 锁根目录。
+    ///   进 ckpt-history.json，防护期间可回看）→ 重建空目录 → 锁根目录。
     ///
     /// 两条路都过写入探测校验后记录 guard.json（锁定时刻 + calls 基线）
     pub fn apply(
@@ -397,7 +468,7 @@ impl SnapshotGuard {
         keep_files: bool,
     ) -> Result<SnapshotGuardStatus, String> {
         if !SUPPORTED {
-            return Err("文件锁仅支持 macOS（chflags）".into());
+            return Err("文件锁仅支持 macOS / Windows".into());
         }
         let dir = checkpoints_dir().ok_or("无法定位用户目录")?;
         // 上代防护可能是递归锁（保留模式），先整树解锁才能改动（幂等）
@@ -444,12 +515,12 @@ impl SnapshotGuard {
         Ok(self.status(true))
     }
 
-    /// 解除防护：递归 nouchg 解锁（兼容保留模式的整树锁）；文件一律不动——
-    /// 删除模式目录本就为空，保留模式快照原地恢复可写，ZCode 自动续上。
-    /// 清空 guard.json 计数
+    /// 解除防护：整树解锁（mac 递归 nouchg / win 移除拒绝 ACE 含继承副本；
+    /// 兼容保留模式的整树锁）；文件一律不动——删除模式目录本就为空，
+    /// 保留模式快照原地恢复可写，ZCode 自动续上。清空 guard.json 计数
     pub fn release(&mut self, calls_today: u64) -> Result<SnapshotGuardStatus, String> {
         if !SUPPORTED {
-            return Err("文件锁仅支持 macOS（chflags）".into());
+            return Err("文件锁仅支持 macOS / Windows".into());
         }
         let dir = checkpoints_dir().ok_or("无法定位用户目录")?;
         if probe_locked(&dir) {
@@ -597,5 +668,66 @@ mod tests {
         assert!(!valid_hash_name("a b"));
         assert!(!valid_hash_name("哈希"));
         assert!(!valid_hash_name(&"x".repeat(129)));
+    }
+
+    /// whoami /user /fo csv /nh → SID：实测两列带引号 CRLF；容忍多余列、
+    /// 空行、无引号写法；无 SID 行（报错输出）返回 None
+    #[test]
+    fn parse_whoami_sid_finds_sid_field() {
+        let sid = "S-1-5-21-2444046543-1064250523-2101273865-1001";
+        // 实测格式（superdesktop，2026-09-20）
+        assert_eq!(
+            parse_whoami_sid(&format!("\"superdesktop\\moqiq\",\"{sid}\"\r\n")),
+            Some(sid.to_string())
+        );
+        // 带第三列（部分版本输出登次类型）/ 多行 / 无引号
+        assert_eq!(
+            parse_whoami_sid(&format!("\"x\",\"{sid}\",\"7\"\n")),
+            Some(sid.to_string())
+        );
+        assert_eq!(parse_whoami_sid(&format!("头部噪音\n{sid}\n")), Some(sid.to_string()));
+        assert_eq!(parse_whoami_sid(""), None);
+        assert_eq!(parse_whoami_sid("\"only user\",\"no sid here\""), None);
+        // 形似但非法（空格/分号）不放行——拼进 icacls 参数必须严
+        assert_eq!(parse_whoami_sid("\"S-1-5 x\""), None);
+    }
+
+    /// Windows 拒绝 ACE 全生命周期（真实 icacls，本机实证的守护测试）：
+    /// 锁 → 根与既有子目录创建/改写被拒且**读取照常**（含 (OI)(CI) 自动
+    /// 传播到锁定前已存在的子树）→ 解锁 → 全部恢复。锁不含 D/DC 的依据
+    /// 见 `set_immutable`（key-rules #16：拒 D 连读都会被以 DELETE 打开
+    /// 的工具阻断）
+    #[test]
+    #[cfg(windows)]
+    fn windows_icacls_lock_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sp-guard-test-{}", std::process::id()));
+        // 上次失败的残留可能还锁着：先尽力解锁再清场
+        if dir.exists() {
+            let _ = set_immutable(&dir, false, false);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        std::fs::create_dir_all(dir.join("sub")).expect("建临时目录");
+        std::fs::write(dir.join("sub").join("f.txt"), "hi").expect("建测试文件");
+
+        set_immutable(&dir, true, false).expect("icacls 拒绝 ACE 应成功");
+        assert!(probe_locked(&dir), "锁定后根目录写入探测应失败");
+        assert!(
+            std::fs::File::create(dir.join("sub").join("new")).is_err(),
+            "锁定后既有子目录内创建应被拒（继承传播生效）"
+        );
+        assert!(
+            std::fs::write(dir.join("sub").join("f.txt"), "x").is_err(),
+            "锁定后改写既有文件应被拒"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub").join("f.txt")).as_deref().ok(),
+            Some("hi"),
+            "锁定不得挡读取（扫描/记录列表依赖）"
+        );
+
+        set_immutable(&dir, false, false).expect("icacls 移除拒绝 ACE 应成功");
+        assert!(!probe_locked(&dir), "解锁后根目录应可写");
+        std::fs::write(dir.join("sub").join("new"), "x").expect("解锁后应可创建");
+        std::fs::remove_dir_all(&dir).expect("清理临时目录");
     }
 }

@@ -90,7 +90,8 @@ struct AppState {
     live: Mutex<LiveIo>,
     /// 网络流量监控（netio.rs：整机接口计数 + 连接归属 + 快照上传证据）
     net: Mutex<netio::NetIo>,
-    /// 快照防护（snapshot_guard.rs：chflags 目录不可变锁，随 poller 每拍更新）
+    /// 快照防护（snapshot_guard.rs：目录写入锁 mac chflags / win icacls 拒绝
+    /// ACE，随 poller 每拍更新）
     guard: Mutex<snapshot_guard::SnapshotGuard>,
     debug: Mutex<DebugLog>,
     persist: Mutex<Persisted>,
@@ -1019,6 +1020,7 @@ fn toggle_window_maximize(window: &tauri::WebviewWindow) {
 fn toggle_maximize_safe(window: tauri::WebviewWindow, state: tauri::State<'_, AppState>) {
     #[cfg(windows)]
     {
+        let _ = &state; // state 仅 mac 分支使用，消除 Windows 未用警告
         toggle_window_maximize(&window);
     }
     #[cfg(target_os = "macos")]

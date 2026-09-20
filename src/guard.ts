@@ -1,7 +1,8 @@
 // 快照防护卡片（完整面板，网络监控卡下方）：状态徽标 + 已积累工件统计 +
 // 开启/解除按钮（自绘确认弹窗，明示损失「检查点回滚 / 时间线」——用户
-// 要求的知情同意，key-rules #16）。后端 snapshot_guard.rs 用 chflags 不可变
-// 锁阻断 ZCode 工作区快照落盘上传：不碰网络、不影响模型对话/补全/工具调用；
+// 要求的知情同意，key-rules #16）。后端 snapshot_guard.rs 用目录写入锁
+// （macOS chflags 不可变标志 / Windows ACL 拒绝创建/写入）阻断 ZCode 工作
+// 区快照落盘上传：不碰网络、不影响模型对话/补全/工具调用；
 // 状态随 metrics payload 的 guard 字段每拍推送（src/main.ts 调 renderGuard）。
 import { fmtBytes } from "./gauges";
 import type { CkptStat } from "./mock";
@@ -57,7 +58,7 @@ export function renderGuard(g: GuardStatus | null): void {
   e.applyBtn.disabled = !g.supported;
   e.releaseBtn.disabled = !g.supported;
   if (!g.supported) {
-    e.scope.textContent = "文件锁仅支持 macOS";
+    e.scope.textContent = "文件锁仅支持 macOS / Windows";
   }
   // 状态三态（术语用平实词，不用内部黑话）：
   // 未防护 = 实时扫描统计；防护中·快照已保留 = 递归锁、文件只读留原地；
