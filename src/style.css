@@ -869,10 +869,10 @@ body.float-mode.style-pill #float-pill {
   padding: 0 12px;
 }
 
-/* 主环占左侧 96px，右侧留给"上轮"小环（窗口 128×128 正方形，见 main.rs FLOAT_GAUGE_SIZE）；
+/* 主环占左侧 116px，右侧留给"上轮"小环（窗口 148×148 正方形，见 main.rs FLOAT_GAUGE_SIZE）；
    主环半径由画布尺寸推出，收窄画布宽度即同时缩小主环与速度数字 */
 #mini-gauge {
-  width: 96px;
+  width: 116px;
   height: 100%;
 }
 

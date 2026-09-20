@@ -355,7 +355,9 @@ export class ArcGauge extends BaseGauge {
 /** 悬浮窗用的迷你仪表盘 */
 export class MiniGauge extends BaseGauge {
   constructor(canvas: HTMLCanvasElement, opts?: { color?: string; color2?: string; tiers?: readonly SpeedTier[] }) {
-    super(canvas, { color: opts?.color ?? "#22d3ee", color2: opts?.color2 ?? "#0ea5e9", minScale: 10, tiers: opts?.tiers });
+    // 最小量程与完整面板当前速度表一致（60 t/s），分档色同用 SPEED_TIERS，
+    // 两处表盘读弧口径相同
+    super(canvas, { color: opts?.color ?? "#22d3ee", color2: opts?.color2 ?? "#0ea5e9", minScale: 60, tiers: opts?.tiers });
   }
 
   protected draw() {
