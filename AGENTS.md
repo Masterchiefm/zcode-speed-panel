@@ -1,6 +1,6 @@
 # AGENTS.md
 
-ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows / macOS 双平台），实时实测 ZCode CLI 的流式输出速度并统计今日 token 用量，附带网络流量与上传监控（会话/非会话拆分）与快照防护（mac chflags / win ACL 拒绝 ACE 阻断工作区快照静默上传）。前端为无框架 TypeScript + Canvas（Vite），后端 Rust 通过 `~/.zcode/cli/db/db.sqlite`（只读）、进程 IO 计数、网络接口计数与 `~/.zcode/v2/checkpoints/` 状态文件取数。
+ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows / macOS 双平台），实时实测 ZCode CLI 的流式输出速度并统计今日 token 用量，附带网速监控（整机实测 + 会话估算拆分）与「快照防护与上传记录」卡（快照相关 UI 的唯一归处：防护开关 mac chflags / win ACL 拒绝 ACE 阻断工作区快照静默上传 + 今日快照上传 + 上传记录列表）。前端为无框架 TypeScript + Canvas（Vite），后端 Rust 通过 `~/.zcode/cli/db/db.sqlite`（只读）、进程 IO 计数、网络接口计数与 `~/.zcode/v2/checkpoints/` 状态文件取数。
 
 ## 命令
 
@@ -32,17 +32,17 @@ python scripts/estats_probe.py      # 复验 TCP ESTATS 每连接字节可用性
 ```
 src-tauri/src/metrics.rs   数据层：usage 库轮询 + 当日聚合（Engine/Aggregator，纯函数可测）
 src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windows 进程句柄 IO / macOS libproc+rusage）+ 平台参数化清洗（CleanParams）/积分/校准 + 多任务进程集合聚合（pick_pid_set/merge_streams，归属迟滞/跨进程样本守卫）+ 轮均速漂移自动重校准（RoundDrift）
-src-tauri/src/netio.rs     网络流量与上传监控：整机接口计数（win GetIfTable 32 位逐接口模差 / mac getifaddrs 去重）+ 会话/非会话上传拆分（token 估算 ≈ + checkpoints 工件真实下界）+ TCP 连接按进程分组（仅 win）+ 当日累计持久化
+src-tauri/src/netio.rs     网速监控：整机接口计数（win GetIfTable 32 位逐接口模差 / mac getifaddrs 去重）+ 会话/非会话上传拆分（token 估算 ≈ + checkpoints 工件真实下界）+ TCP 连接按进程分组（仅 win）+ 当日累计持久化
 src-tauri/src/snapshot_guard.rs  快照防护：锁定 ~/.zcode/v2/checkpoints 阻断工作区快照静默上传（mac chflags uchg / win icacls 拒绝 ACE·SID 必须 whoami 取·故意不拒删——拒 D 连读都会被以 DELETE 打开的工具阻断；写入探测定状态、calls 增量计轮次、guard.json 持久化；双平台）
 src-tauri/src/updater.rs   应用内更新：GitHub Releases 检查/下载/安装（纯函数 parse_version/is_newer/pick_asset 可测；产物命名耦合见 key-rules #12）
 src-tauri/src/main.rs      应用层：轮询线程、更新检查线程、窗口模式/位置持久化、托盘（mac 菜单栏 + 动态 Dock 两态：完整面板 Regular/悬浮窗 Accessory）、DebugLog
 src-tauri/examples/        dump/verify 调试工具（#[path] include src，改公开 API 须同步）
 src-tauri/capabilities/    Tauri 前端权限白名单（窗口 API 必须在此放行）
-src/                       前端：main.ts 装配 / gauges.ts 绘制 / model_stats.ts 模型趋势弹窗（图例 chips 多选）/ guard.ts 快照防护卡片 / pet.ts 桌宠 / mock.ts 预览
+src/                       前端：main.ts 装配 + 模块显隐设置（顶栏 ⚙，localStorage modules.v1）+ 快照卡记录区 renderSnapshot / gauges.ts 绘制 / model_stats.ts 模型趋势弹窗（图例 chips 多选）/ guard.ts 快照卡防护控制区 / pet.ts 桌宠 / mock.ts 预览
 public/pets/               宠物包资源；scripts/*.py 调试日志分析；.github/workflows/ CI
 ```
 
-数据流：poller 线程每 ~700ms 一拍 → `Engine.poll`（SQLite 增量摄取）→ `Engine.snapshot`（当日聚合 + 90 桶曲线）→ `LiveIo.measure`（进程集合清洗/门控/一致性校准 → 覆写实时值；多任务并发时聚合总吞吐 + 分任务明细）→ `NetIo.tick`（整机接口差分 + 连接归属 + checkpoints 工件事件 → 网络卡字段与会话流量估算）→ `SnapshotGuard.tick`（快照防护锁定探测 + 轮次累计 → guard 字段）→ 托盘状态项更新 → DebugLog（JSONL）→ `emit("metrics")` → 前端渲染。
+数据流：poller 线程每 ~700ms 一拍 → `Engine.poll`（SQLite 增量摄取）→ `Engine.snapshot`（当日聚合 + 90 桶曲线）→ `LiveIo.measure`（进程集合清洗/门控/一致性校准 → 覆写实时值；多任务并发时聚合总吞吐 + 分任务明细）→ `NetIo.tick`（整机接口差分 + 连接归属 + checkpoints 工件事件 → 网络卡字段、会话流量估算与快照卡记录数据）→ `SnapshotGuard.tick`（快照防护锁定探测 + 轮次累计 → guard 字段）→ 托盘状态项更新 → DebugLog（JSONL）→ `emit("metrics")` → 前端渲染。
 
 ## 规则与踩坑（全在 docs，AGENTS 不留副本）
 
@@ -57,6 +57,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 - 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（六档：0–40 绿 / 40–80 黄绿 / 80–160 黄 / 160–240 橙 / 240–320 红 / 320+ 品红，整弧换色不分段，背景轨道恒灰），主表、迷你仪表、"上轮"角标小表（`BadgeGauge`）与胶囊/桌宠的上轮读数共用（`speedColor()` 统一取色）；浮动窗口尺寸改动须同步 `main.rs` 的 `FLOAT_*_SIZE`、`docs/features.md` 与 README。桌宠窗口为"正方形精灵区 + 顶部 `PET_BUBBLE_RESERVE` 气泡预留带"，多任务（≥2 进程，3 拍防抖）期间再向上加高 `PET_TASK_EXTRA`——尺寸口径分布在 `apply_mode`/`set_float_size`/`apply_pet_size` 三处（`pet.ts` 按画布短边定位精灵区），改其一须同步其余；气泡向上生长、精灵不缩小。
 - CI 不随推送自动触发（省机时）：出包走 `v*` 标签（自动发 Release：Windows exe + macOS 双架构 dmg）或 Actions 页手动 Run workflow（Artifacts：windows / macos-x86_64-apple-darwin / macos-aarch64-apple-darwin）；改动 workflow 触发逻辑须同步 README 与 `docs/features.md`。**发版 = 三处版本号同步 bump（`tauri.conf.json` 权威 / `Cargo.toml` / `package.json`）+ `v*` 标签**——应用内更新按 Release 资产名后缀匹配安装包，build.yml 产物命名与 `updater::pick_asset` 是同一协议，改其一须同步另一个（key-rules #12）。
 - 完整面板与悬浮窗位置各自独立记忆（`~/.zcode/speed-panel-mode.txt`）；悬浮窗尺寸用逻辑像素，物理换算走 `scale_factor()`，多屏定位必须 `clamp_to_screen`。
+- 完整面板模块显隐与排序在顶栏 ⚙ 设置（localStorage `modules.v1`；默认显示仪表盘/网速监控/曲线，**快照防护卡默认隐藏**）。每模块包一层 `.module-wrap[data-module]`（`display:contents`，卡片仍是 main 的 flex 项）——**新增面板模块须同步**：index.html 加包装层 + main.ts 的 `MODULE_DEFS`/`MODULES_DEFAULT_ORDER`/`MODULES_DEFAULT_HIDDEN`，详见 features.md「模块显隐与排序」。
 
 ## 文档索引（按需阅读）
 

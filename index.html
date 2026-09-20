@@ -34,6 +34,17 @@
             type="button"
             title="桌宠气泡常驻显示两行（实时速度 / 上轮均速），待机时也显示，无需鼠标悬停；与桌宠右键菜单里的勾选是同一开关"
           ><span class="pet-chk" aria-hidden="true"></span>常显上轮均速</button>
+          <!-- 设置：模块显隐与排序（齿轮用内联 SVG，同 ⟳ 按钮——符号字形居中不可靠） -->
+          <button
+            id="btn-settings"
+            class="ghost-btn settings-btn"
+            type="button"
+            title="设置：勾选显示的模块、调整上下顺序（即时生效并记住）"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="currentColor">
+              <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+            </svg>
+          </button>
           <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
         </div>
         <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
@@ -44,6 +55,11 @@
       </header>
 
       <main>
+        <!-- 模块显隐与排序（顶栏 ⚙ 设置）：每个模块包一层 module-wrap[data-module]，
+             main.ts 按 localStorage 配置（modules.v1）重排 DOM 顺序并隐藏未勾选的模块；
+             wrapper 为 display:contents 不参与布局——卡片仍是 main 的直接 flex 项，
+             卡片间距（gap 14px）与曲线卡的 flex:1 拉伸口径都不变 -->
+        <div class="module-wrap" data-module="gauges">
         <section class="cards">
           <div class="card gauge-card">
             <button
@@ -79,9 +95,10 @@
           </div>
         </section>
 
-        <!-- 并发任务明细：≥2 个任务时出现（单任务时不占位）。
-             一个 CLI 进程 = 一行；同进程内并行的多个会话/子代理在字节层不可拆分，
-             计为一行合计（标注会话数），按会话数计入任务总数 -->
+        <!-- 并发任务明细：≥2 个任务时出现（单任务时不占位）。属仪表盘模块（只在
+             其下方出现，不单独排序/开关）。一个 CLI 进程 = 一行；同进程内并行的
+             多个会话/子代理在字节层不可拆分，计为一行合计（标注会话数），按会话数
+             计入任务总数 -->
         <section class="card task-card" id="task-card" hidden>
           <div class="chart-head">
             <span>并发任务（按 CLI 进程实测）</span>
@@ -89,93 +106,100 @@
           </div>
           <div id="task-list"></div>
         </section>
+        </div>
 
-        <!-- 网络流量与上传监控：整机接口实测速度 + 会话/非会话上传拆分。
+        <!-- 网速监控：整机接口实测速度 + 会话上传估算拆分。
              按进程直测网络字节无公开原语（socket 不进进程 IO 计数、ESTATS 已坏），
-             口径分层：整机=真实 / 快照上传=真实下界 / 会话=token 估算（≈）。
-             双栏布局（左：速度与当日累计 / 右：快照上传记录）控制卡片高度，
-             窄窗口（<860px）自动退回单栏 -->
+             口径分层：整机=真实 / 会话=token 估算（≈）。
+             快照相关内容（防护/今日快照上传/上传记录）都在下方快照防护卡 -->
+        <div class="module-wrap" data-module="net">
         <section class="card net-card" id="net-card" hidden>
           <div class="chart-head">
-            <span>网络流量与上传监控</span>
+            <span>网速监控</span>
             <span class="dim" id="net-scope">整机实测</span>
           </div>
+          <!-- 单行三段：速度居左 · 进程连接数居中 · 今日上传/下载最右（窄窗自动换行） -->
           <div class="net-body">
-            <div class="net-left">
-              <div class="net-speeds">
-                <div class="net-speed up" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络上传，非仅 ZCode。约 1 秒滑窗平均，单位为字节；全部非回环接口求和（虚拟网卡/VPN 隧道的流量内外层各计一次）。与任务管理器对比：任务管理器显示比特（×8 ≈ 字节）且 Wi-Fi 页仅统计所选适配器，读数对不上是口径差异。ZCode 的部分见下方拆分与连接归属">
-                  <span class="net-arrow">↑</span>
-                  <div class="net-speed-body">
-                    <span class="net-val" id="net-up-bps">--</span>
-                    <span class="net-sub">整机上传 · 全部应用</span>
-                  </div>
-                </div>
-                <div class="net-speed down" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络下载，非仅 ZCode。约 1 秒滑窗平均，单位为字节；全部非回环接口求和（虚拟网卡/VPN 隧道的流量内外层各计一次）。与任务管理器对比：任务管理器显示比特（×8 ≈ 字节）且 Wi-Fi 页仅统计所选适配器，读数对不上是口径差异。会话（模型输出）的估算值见下方">
-                  <span class="net-arrow">↓</span>
-                  <div class="net-speed-body">
-                    <span class="net-val" id="net-down-bps">--</span>
-                    <span class="net-sub">整机下载 · 全部应用</span>
-                  </div>
-                </div>
-                <div class="net-conns" id="net-conns" title="两组都是 ZCode 自身进程的连接（不含其他应用）：会话进程 = CLI（app-server），走对话 API 流量；桌面端 = ZCode 桌面端（Electron 主/渲染/GPU/工具进程），走快照上传、遥测等非对话流量。悬停下方两行可看每条连接的远端与归属进程">
-                  <span class="net-conn-row" id="net-conn-cli" title="">ZCode 会话进程 <b id="net-cli-conns">0</b> 连接</span>
-                  <span class="net-conn-row" id="net-conn-app" title="">ZCode 桌面端 <b id="net-app-conns">0</b> 连接</span>
+            <div class="net-speeds">
+              <div class="net-speed up" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络上传，非仅 ZCode。约 1 秒滑窗平均，单位为字节；全部非回环接口求和（虚拟网卡/VPN 隧道的流量内外层各计一次）。与任务管理器对比：任务管理器显示比特（×8 ≈ 字节）且 Wi-Fi 页仅统计所选适配器，读数对不上是口径差异。ZCode 的部分见连接归属与今日累计拆分">
+                <span class="net-arrow">↑</span>
+                <div class="net-speed-body">
+                  <span class="net-val" id="net-up-bps">--</span>
+                  <span class="net-sub">整机上传 · 全部应用</span>
                 </div>
               </div>
-              <div class="net-today">
-                <div class="net-today-row">
-                  <span class="net-today-label">今日上传</span>
-                  <span class="net-part">会话 ≈<b id="net-sess-up">--</b></span>
-                  <span class="net-part warn" id="net-ckpt-part">快照上传 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
-                  <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入；与旁边的快照上传（按 state.json 接受事件整包计入、当日首启回补）相互独立口径">整机 <b id="net-up-today">--</b></span>
-                </div>
-                <div class="net-today-row">
-                  <span class="net-today-label">今日下载</span>
-                  <span class="net-part">会话 ≈<b id="net-sess-down">--</b></span>
-                  <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入">整机 <b id="net-down-today">--</b></span>
+              <div class="net-speed down" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络下载，非仅 ZCode。约 1 秒滑窗平均，单位为字节；全部非回环接口求和（虚拟网卡/VPN 隧道的流量内外层各计一次）。与任务管理器对比：任务管理器显示比特（×8 ≈ 字节）且 Wi-Fi 页仅统计所选适配器，读数对不上是口径差异。会话（模型输出）的估算值见今日下载一栏">
+                <span class="net-arrow">↓</span>
+                <div class="net-speed-body">
+                  <span class="net-val" id="net-down-bps">--</span>
+                  <span class="net-sub">整机下载 · 全部应用</span>
                 </div>
               </div>
-              <div class="net-ckpt" id="net-ckpt-info" hidden>
-                <span class="dot live" id="net-ckpt-dot"></span>
-                <span id="net-ckpt-text"></span>
-              </div>
-              <div class="net-ckpt-names" id="net-ckpt-names" hidden></div>
             </div>
-            <div class="net-right">
-              <div class="net-ckpt-list-head" id="net-ckpt-list-head">
-                <span class="dim">快照上传记录（ZCode 各工作区 · 时间 / 工作区 / 加密后大小 / 状态，上下滚动查看全部）</span>
-                <span class="net-ckpt-tools">
-                  <button id="net-ckpt-copy" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录复制到剪贴板">复制</button>
-                  <button id="net-ckpt-export" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录导出为文本文件（保存到 ~/.zcode/speed-panel-exports/）">导出</button>
-                </span>
+            <div class="net-conns" id="net-conns" title="两组都是 ZCode 自身进程的连接（不含其他应用）：会话进程 = CLI（app-server），走对话 API 流量；桌面端 = ZCode 桌面端（Electron 主/渲染/GPU/工具进程），走快照上传、遥测等非对话流量。悬停下方两行可看每条连接的远端与归属进程">
+              <span class="net-conn-row" id="net-conn-cli" title="">ZCode 会话进程 <b id="net-cli-conns">0</b> 连接</span>
+              <span class="net-conn-row" id="net-conn-app" title="">ZCode 桌面端 <b id="net-app-conns">0</b> 连接</span>
+            </div>
+            <div class="net-today">
+              <div class="net-today-row">
+                <span class="net-today-label">今日上传</span>
+                <span class="net-part">会话 ≈<b id="net-sess-up">--</b></span>
+                <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入。ZCode 快照上传的当日累计在下方快照防护卡（按 state.json 接受事件整包计入、当日首启回补，相互独立口径）">整机 <b id="net-up-today">--</b></span>
               </div>
-              <div class="net-ckpt-list" id="net-ckpt-list"></div>
+              <div class="net-today-row">
+                <span class="net-today-label">今日下载</span>
+                <span class="net-part">会话 ≈<b id="net-sess-down">--</b></span>
+                <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入">整机 <b id="net-down-today">--</b></span>
+              </div>
             </div>
           </div>
         </section>
+        </div>
 
-        <!-- 快照防护：阻断 ZCode 工作区快照静默上传（目录写入锁：macOS chflags
-             不可变标志 / Windows ACL 拒绝创建/写入）。
-             状态随 metrics payload 附带推送；开启/解除都必须先过下方确认弹窗
-             （明示损失「检查点回滚 / 时间线」，key-rules #16） -->
+        <!-- 快照防护与上传记录：ZCode 快照相关的一切都在这张卡——
+             防护开关（目录写入锁：macOS chflags 不可变标志 / Windows ACL
+             拒绝创建/写入）+ 今日快照上传 + 快照上传记录列表。
+             防护状态随 metrics payload 附带推送；开启/解除都必须先过下方
+             确认弹窗（明示损失「检查点回滚 / 时间线」，key-rules #16）。
+             默认不在设置里勾选（显式开启才显示） -->
+        <div class="module-wrap" data-module="guard">
         <section class="card guard-card" id="guard-card" hidden>
           <div class="chart-head">
-            <span title="防护原理：ZCode 上传工作区快照（整个项目含 .git 历史，加密压缩包）之前，必须先把它写到 ~/.zcode/v2/checkpoints/ 目录。防护 = 锁定该目录（macOS：chflags uchg 不可变标志；Windows：目录 ACL 拒绝创建/写入），ZCode 从此写不进新文件——没有本地落盘，就没有东西可上传。全程不碰网络、不碰进程，模型对话/补全/工具调用不受影响。&#10;&#10;监控边界（如实说明，不打包票）：&#10;① 锁定状态每拍做写入探测——锁被意外/人为解除会立即显示「未防护」；&#10;② 已知机制下 ZCode 写不进目录，新快照恒为 0（「防护后 N 轮 · 0 新快照」即阻断证据）；&#10;③ 整机上传速度监控独立兜底——若 ZCode 将来改用不经本地落盘的直传，文件锁拦不住它，只能靠流量异常（无对话时上传飙升）发现；mac 无按进程的连接归属，分辨不了是哪个进程在传。&#10;结论：已知上传机制（先落盘再上传）可确定阻断并留痕；换新机制的偷传无法事前阻止，只能靠流量层发现异常。">快照防护（工作区快照静默上传）</span>
+            <span title="防护原理：ZCode 上传工作区快照（整个项目含 .git 历史，加密压缩包）之前，必须先把它写到 ~/.zcode/v2/checkpoints/ 目录。防护 = 锁定该目录（macOS：chflags uchg 不可变标志；Windows：目录 ACL 拒绝创建/写入），ZCode 从此写不进新文件——没有本地落盘，就没有东西可上传。全程不碰网络、不碰进程，模型对话/补全/工具调用不受影响。&#10;&#10;监控边界（如实说明，不打包票）：&#10;① 锁定状态每拍做写入探测——锁被意外/人为解除会立即显示「未防护」；&#10;② 已知机制下 ZCode 写不进目录，新快照恒为 0（「防护后 N 轮 · 0 新快照」即阻断证据）；&#10;③ 整机上传速度监控独立兜底——若 ZCode 将来改用不经本地落盘的直传，文件锁拦不住它，只能靠流量异常（无对话时上传飙升）发现；mac 无按进程的连接归属，分辨不了是哪个进程在传。&#10;结论：已知上传机制（先落盘再上传）可确定阻断并留痕；换新机制的偷传无法事前阻止，只能靠流量层发现异常。">快照防护与上传记录</span>
             <span class="dim" id="guard-scope">目录写入锁定 · 可逆</span>
           </div>
           <div class="guard-body">
-            <div class="guard-row">
-              <span id="guard-badge" class="guard-badge">🔓 未防护</span>
-              <button id="guard-apply" class="ghost-btn accent-btn" type="button">开启防护</button>
-              <button id="guard-release" class="ghost-btn" type="button" hidden>解除防护</button>
-              <span id="guard-msg" class="guard-msg"></span>
+            <!-- 防护控制区：后端无 guard 字段（浏览器预览/mock）时整块隐藏，只看记录 -->
+            <div class="guard-ctl" id="guard-ctl">
+              <div class="guard-row">
+                <span id="guard-badge" class="guard-badge">🔓 未防护</span>
+                <button id="guard-apply" class="ghost-btn accent-btn" type="button">开启防护</button>
+                <button id="guard-release" class="ghost-btn" type="button" hidden>解除防护</button>
+                <span id="guard-msg" class="guard-msg"></span>
+              </div>
+              <div class="guard-stats" id="guard-stats">--</div>
+              <div class="guard-stats" id="guard-rounds" hidden></div>
             </div>
-            <div class="guard-stats" id="guard-stats">--</div>
-            <div class="guard-stats" id="guard-rounds" hidden></div>
-            <div class="dim guard-note">ZCode 登录后会将整个工作区（含 .git 历史）加密上传；防护通过文件系统目录写入锁阻断其落盘，不碰网络，不影响模型对话/补全/工具调用。代价：损失「检查点回滚 / 时间线」功能；随时可解除（目录会自动重建）。</div>
+            <!-- 今日快照上传状态行：上传中脉冲 / blocked / 有量，防护中标注"防护前" -->
+            <div class="ckpt-status" id="ckpt-info" hidden>
+              <span class="dot live" id="ckpt-dot"></span>
+              <span id="ckpt-text"></span>
+            </div>
+            <div class="ckpt-names" id="ckpt-names" hidden></div>
+            <div class="ckpt-list-head" id="ckpt-list-head">
+              <span class="dim">快照上传记录（ZCode 各工作区 · 时间 / 工作区 / 加密后大小 / 状态，上下滚动查看全部）</span>
+              <span class="ckpt-tools">
+                <button id="ckpt-copy" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录复制到剪贴板">复制</button>
+                <button id="ckpt-export" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录导出为文本文件（保存到 ~/.zcode/speed-panel-exports/）">导出</button>
+              </span>
+            </div>
+            <div class="ckpt-list" id="ckpt-list"></div>
+            <div class="dim guard-note" id="guard-note" hidden>ZCode 登录后会将整个工作区（含 .git 历史）加密上传；防护通过文件系统目录写入锁阻断其落盘，不碰网络，不影响模型对话/补全/工具调用。代价：损失「检查点回滚 / 时间线」功能；随时可解除（目录会自动重建）。</div>
           </div>
         </section>
+        </div>
 
+        <div class="module-wrap" data-module="chart">
         <section class="card chart-card">
           <div class="chart-head">
             <span>近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
@@ -186,6 +210,10 @@
           </div>
           <canvas id="spark"></canvas>
         </section>
+        </div>
+
+        <!-- 全部模块都被隐藏时的占位（设置按钮在顶栏，始终可再打开） -->
+        <div id="modules-empty" hidden>所有模块都已隐藏 · 点顶栏 ⚙ 重新开启</div>
 
       <footer class="dim" id="statusbar">
         <span id="st-dir">监控目录：…</span>
@@ -288,6 +316,21 @@
             <button id="guard-confirm-ok" class="ghost-btn accent-btn" type="button">确认开启</button>
             <button id="guard-confirm-cancel" class="ghost-btn" type="button">取消</button>
           </div>
+        </div>
+      </div>
+
+      <!-- 设置弹窗：模块显隐与排序（顶栏 ⚙ 打开；复用模型详情弹窗的遮罩+卡片风格）。
+           行由 main.ts 按 MODULE_DEFS 动态渲染：自绘勾选框（.pet-chk 同款）+ ↑↓ 排序，
+           变更即时生效并存 localStorage（modules.v1） -->
+      <div id="settings-modal">
+        <div id="settings-modal-box">
+          <div class="model-modal-head">
+            <span class="model-modal-title">设置 · 显示模块</span>
+            <button id="settings-reset" class="ghost-btn" type="button" title="恢复默认：仪表盘 / 网速监控 / 近 15 分钟输出速度显示，快照防护与上传记录隐藏，顺序还原">恢复默认</button>
+            <button id="settings-close" class="ghost-btn" type="button" title="关闭">✕</button>
+          </div>
+          <div id="settings-hint" class="dim">勾选要显示的模块；↑↓ 调整顺序（列表从上到下 = 面板从上到下）。即时生效并记住。</div>
+          <div id="settings-modules"></div>
         </div>
       </div>
 

@@ -17,6 +17,12 @@
   padding: 0;
 }
 
+/* hidden 属性必须压过任何 display 规则（.ckpt-status 等块是 display:flex，
+   作者样式会盖掉 UA 的 [hidden]{display:none}，导致"隐藏"元素仍占位出点） */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body,
 #app {
@@ -311,38 +317,20 @@ main {
   font-weight: 600;
 }
 
-/* ---- 网络流量与上传监控卡：整机速度 + 会话/非会话上传拆分 ---- */
+/* ---- 网速监控卡：整机速度 + 会话上传估算（快照内容在快照防护卡） ---- */
 .net-card {
   padding: 12px 16px 10px;
   flex: none;
 }
 
-/* 双栏：左（速度/当日累计/状态）+ 右（快照上传记录），压住卡片高度
- * 不把底部曲线卡挤出视口；窄窗口退回单栏 */
+/* 单行横排：速度居左、进程连接数居中、当日累计居右（conns 与 today 各持
+ * 一个 margin-left:auto，空余空间在两处均分 → 中间/最右就位）；窄窗口自动换行 */
 .net-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
-  gap: 6px 20px;
-}
-
-.net-left {
   min-width: 0;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.net-right {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-@media (max-width: 860px) {
-  .net-body {
-    grid-template-columns: 1fr;
-  }
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 26px;
 }
 
 .net-speeds {
@@ -418,6 +406,7 @@ main {
 }
 
 .net-today {
+  margin-left: auto; /* 与 conns 的 auto 均分空隙：conns 居中、本块靠最右 */
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -444,27 +433,25 @@ main {
   margin-left: 3px;
 }
 
-/* 快照工件（非会话上传）行：有量或上传中时用琥珀警示色 */
-.net-part.warn b {
-  color: #fbbf24;
-}
+/* ---- 以下快照相关元素现居快照防护卡（guard-card），类名去掉 net- 前缀 ---- */
 
-.net-ckpt {
+/* 今日快照上传状态行：上传中时圆点脉冲 */
+.ckpt-status {
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 13px;
 }
 
-.net-ckpt .dot.live {
+.ckpt-status .dot.live {
   animation: none;
 }
 
-.net-ckpt.uploading .dot.live {
+.ckpt-status.uploading .dot.live {
   animation: pulse 1.6s ease-in-out infinite;
 }
 
-.net-ckpt-list-head {
+.ckpt-list-head {
   font-size: 11.5px;
   display: flex;
   align-items: center;
@@ -472,14 +459,14 @@ main {
   gap: 8px;
 }
 
-.net-ckpt-list-head > span:first-child {
+.ckpt-list-head > span:first-child {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.net-ckpt-tools {
+.ckpt-tools {
   flex: none;
   display: inline-flex;
   gap: 4px;
@@ -495,7 +482,7 @@ main {
 
 /* 今日快照工件的工作区名单：状态行下方逐行列出（与状态行文字对齐），
  * 每行 = 工作区 · n 个 · 字节小计，超宽省略（悬停看明细）；可选中复制 */
-.net-ckpt-names {
+.ckpt-names {
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -507,7 +494,7 @@ main {
   cursor: text;
 }
 
-.net-ckpt-name {
+.ckpt-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -516,7 +503,7 @@ main {
 /* 快照上传记录列表：每工作区一行（时间/工作区/大小/状态），固定显示
  * 5 行（行高 18px：5×18 + 4×2 间隙 = 98px），其余列表内上下滚动看完
  * （不把页面整页撑开）。文字可选中复制（全局 user-select:none 的例外） */
-.net-ckpt-list {
+.ckpt-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -530,11 +517,11 @@ main {
   scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
 }
 
-.net-ckpt-list::-webkit-scrollbar {
+.ckpt-list::-webkit-scrollbar {
   width: 6px;
 }
 
-.net-ckpt-list::-webkit-scrollbar-thumb {
+.ckpt-list::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.14);
   border-radius: 3px;
 }
@@ -1354,14 +1341,28 @@ body.float-mode #model-modal {
   display: none !important;
 }
 
-/* ---- 快照防护卡片（guard.ts，网络监控卡下方）与确认弹窗 ---- */
+/* ---- 快照防护与上传记录卡（guard.ts 控制区 + main.ts renderSnapshot 记录区）与确认弹窗 ---- */
+
+/* 卡片级 padding 与网络卡同规格（12/16/10）：基类 .card 不带 padding，
+   此前漏设导致正文距边仅 4px、与其他模块 16px 不一致 */
+.guard-card {
+  padding: 12px 16px 10px;
+}
 
 .guard-card .guard-body {
   display: flex;
   flex-direction: column;
   gap: 8px;
   font-size: 12px;
-  padding: 10px 4px 2px;
+  padding: 10px 0 0;
+}
+
+/* 防护控制区（徽标/按钮/统计）：后端无 guard 字段时整块隐藏（hidden 有
+   !important 兜底，flex 布局盖不掉） */
+.guard-ctl {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .guard-row {
@@ -1645,5 +1646,145 @@ body.float-mode #model-modal {
 /* 悬浮窗/桌宠窗口太小放不下更新 UI：不显示（回到完整面板仍可见） */
 body.float-mode #update-card,
 body.float-mode #update-toast {
+  display: none !important;
+}
+
+/* ---- 模块显隐与排序（顶栏 ⚙ 设置弹窗，main.ts）---- */
+
+/* 模块包装层：只为承载 data-module 供重排/隐藏，不参与布局（display:contents 让
+   卡片仍是 main 的直接 flex 项——间距 gap 14px、曲线卡 flex:1 拉伸口径都不变；
+   隐藏走文件顶部的全局 [hidden]{display:none!important}） */
+.module-wrap {
+  display: contents;
+}
+
+/* 全部模块被隐藏时的占位（顶栏 ⚙ 始终可再打开） */
+#modules-empty {
+  padding: 48px 0;
+  text-align: center;
+  color: var(--dim);
+  font-size: 13px;
+}
+
+/* 顶栏 ⚙ 齿轮按钮：图标按钮与 ⟳ 校准按钮同规格。选择器带 .ghost-btn 提高特异性，
+   压过文件后部 .ghost-btn 的 padding:3px 10px（同 .ghost-btn.recal-btn 的坑） */
+.ghost-btn.settings-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.settings-btn svg {
+  display: block;
+}
+
+/* 设置弹窗：复用模型详情/防护确认弹窗的遮罩 + 卡片风格 */
+#settings-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 95;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 8, 16, 0.55);
+}
+
+#settings-modal-box {
+  width: min(460px, 92%);
+  padding: 14px 18px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+#settings-hint {
+  margin: 8px 0 10px;
+  font-size: 12px;
+}
+
+#settings-modules {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* 未勾选（隐藏中）的模块行整体压暗，勾选态一眼可辨 */
+.settings-row.off .settings-info {
+  opacity: 0.55;
+}
+
+.settings-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 勾选小方框与「常显上轮均速」同款（.pet-chk 结构复用，勾选态走本组件的 .on） */
+.settings-toggle.on .pet-chk {
+  border-color: #22d3ee;
+  background: rgba(34, 211, 238, 0.22);
+}
+
+.settings-toggle.on .pet-chk::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border: solid #22d3ee;
+  border-width: 0 2px 2px 0;
+  transform: rotate(40deg);
+}
+
+.settings-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-name {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.settings-desc {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.settings-order {
+  display: flex;
+  gap: 4px;
+}
+
+/* ↑↓ 方形小按钮：选择器带 .ghost-btn 压过后部声明的 padding */
+.ghost-btn.settings-move {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+}
+
+/* 悬浮窗/桌宠窗口太小放不下设置 UI：不显示（回到完整面板仍可打开） */
+body.float-mode #settings-modal {
   display: none !important;
 }

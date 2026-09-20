@@ -1,9 +1,11 @@
-// 快照防护卡片（完整面板，网络监控卡下方）：状态徽标 + 已积累工件统计 +
-// 开启/解除按钮（自绘确认弹窗，明示损失「检查点回滚 / 时间线」——用户
-// 要求的知情同意，key-rules #16）。后端 snapshot_guard.rs 用目录写入锁
-// （macOS chflags 不可变标志 / Windows ACL 拒绝创建/写入）阻断 ZCode 工作
-// 区快照落盘上传：不碰网络、不影响模型对话/补全/工具调用；
-// 状态随 metrics payload 的 guard 字段每拍推送（src/main.ts 调 renderGuard）。
+// 快照防护与上传记录卡（完整面板，网络监控卡下方）的防护控制区：状态徽标 +
+// 已积累工件统计 + 开启/解除按钮（自绘确认弹窗，明示损失「检查点回滚 /
+// 时间线」——用户要求的知情同意，key-rules #16）。卡片里的今日快照上传与
+// 记录列表由 main.ts 的 renderSnapshot 渲染（快照相关的一切都在这张卡）。
+// 后端 snapshot_guard.rs 用目录写入锁（macOS chflags 不可变标志 /
+// Windows ACL 拒绝创建/写入）阻断 ZCode 工作区快照落盘上传：不碰网络、
+// 不影响模型对话/补全/工具调用；状态随 metrics payload 的 guard 字段每拍
+// 推送（src/main.ts 调 renderGuard；无该字段时控制区隐藏，只看记录）。
 import { fmtBytes } from "./gauges";
 import type { CkptStat } from "./mock";
 
@@ -66,7 +68,7 @@ export function renderGuard(g: GuardStatus | null): void {
   e.stats.textContent = g.locked
     ? g.artifactCount > 0
       ? `防护生效中（快照已保留）：${g.artifactCount} 个加密快照锁定在本地只读（共 ${fmtBytes(g.artifactBytes)}）· ZCode 写不进新快照；记录仍可看、可点 📂 打开`
-      : `防护生效中（快照已删除）：目录已清空并锁定，ZCode 写不进新快照；防护前的上传记录在上方列表完整保留（${g.history.length} 条）`
+      : `防护生效中（快照已删除）：目录已清空并锁定，ZCode 写不进新快照；防护前的上传记录在下方列表完整保留（${g.history.length} 条）`
     : g.artifactCount > 0
       ? `本地已积累加密快照 ${g.artifactCount} 个 · 共 ${fmtBytes(g.artifactBytes)} · ` +
         `覆盖 ${g.workspaceCount} 个项目 · ZCode 记录上传失败 ${g.failureCount} 次`
@@ -166,7 +168,7 @@ export function initGuard(invoke: InvokeFn): void {
         // 保留模式
         `**「保留并锁定」**：本地已积累的 ${latest.artifactCount} 个加密快照（共 ${fmtBytes(latest.artifactBytes)}）**原地保留（只读）**，上传记录仍完整可看、可点 📂 打开快照目录`,
         // 删除模式（用户逐条要求的知情同意）
-        `**「删除并锁定」**：删除全部快照——**原始上传记录会随之消失**；删除前自动备份记录清单（时间 / 工作区 / 加密后大小 / 状态），防护期间可在上方列表回看，**只备份清单**，快照文件等明细删除后无法恢复`,
+        `**「删除并锁定」**：删除全部快照——**原始上传记录会随之消失**；删除前自动备份记录清单（时间 / 工作区 / 加密后大小 / 状态），防护期间可在快照上传记录列表回看，**只备份清单**，快照文件等明细删除后无法恢复`,
         // 共同
         "随时可解除防护（保留的快照原地恢复，空目录由 ZCode 自动重建）",
       ];

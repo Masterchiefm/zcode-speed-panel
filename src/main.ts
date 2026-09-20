@@ -179,16 +179,17 @@ const netCliConnsEl = $("net-cli-conns");
 const netAppConnsEl = $("net-app-conns");
 const netSessUpEl = $("net-sess-up");
 const netSessDownEl = $("net-sess-down");
-const netCkptEl = $("net-ckpt");
-const netCkptCountEl = $("net-ckpt-count");
-const netCkptPart = $("net-ckpt-part");
 const netUpTodayEl = $("net-up-today");
 const netDownTodayEl = $("net-down-today");
-const netCkptInfo = $("net-ckpt-info");
-const netCkptText = $("net-ckpt-text");
-const netCkptNames = $("net-ckpt-names");
-const netCkptListHead = $("net-ckpt-list-head");
-const netCkptList = $("net-ckpt-list");
+// 快照防护与上传记录卡（网络监控卡下方）：防护控制区 + 今日快照上传 + 记录列表
+const guardCard = $("guard-card");
+const guardCtl = $("guard-ctl");
+const guardNote = $("guard-note");
+const ckptInfo = $("ckpt-info");
+const ckptText = $("ckpt-text");
+const ckptNames = $("ckpt-names");
+const ckptListHead = $("ckpt-list-head");
+const ckptList = $("ckpt-list");
 const floatTps = $("float-tps");
 const floatDot = $("float-dot");
 const floatLast = $("float-last");
@@ -210,9 +211,10 @@ function statusClass(s: Snapshot): string {
   return "dot idle";
 }
 
-/** 网络流量与上传监控卡：整机实测速度 + 会话/非会话上传拆分。
- *  整机 = 接口计数器真实值；快照工件 = 非会话上传的真实下界（加密压缩后
- *  字节）；会话 = token×系数估算（带 ≈）。接口不可用（stub 平台）时整卡隐藏 */
+/** 网速监控卡：整机实测速度 + 会话上传估算拆分。
+ *  整机 = 接口计数器真实值；会话 = token×系数估算（带 ≈）。
+ *  快照相关的一切（防护 / 今日快照上传 / 上传记录）在快照防护卡
+ *  （renderSnapshot），本卡不含快照内容。接口不可用（stub 平台）时整卡隐藏 */
 function renderNet(s: Snapshot) {
   if (!s.netAvailable) {
     netCard.hidden = true;
@@ -223,8 +225,6 @@ function renderNet(s: Snapshot) {
   netDownBpsEl.textContent = fmtBps(s.netDownBps);
   netSessUpEl.textContent = fmtBytes(s.netSessUpToday);
   netSessDownEl.textContent = fmtBytes(s.netSessDownToday);
-  netCkptEl.textContent = fmtBytes(s.netCkptToday);
-  netCkptCountEl.textContent = s.netCkptTodayCount > 0 ? `（${s.netCkptTodayCount} 个）` : "";
   netUpTodayEl.textContent = fmtBytes(s.netUpToday);
   netDownTodayEl.textContent = fmtBytes(s.netDownToday);
 
@@ -243,14 +243,29 @@ function renderNet(s: Snapshot) {
       ? `ZCode 桌面端进程（Electron 主/渲染/GPU/工具——快照上传、遥测等非对话流量）的连接：\n${connLines(s.netAppConnList).join("\n")}`
       : "ZCode 桌面端进程当前无外连";
   }
+  netScope.textContent = s.netConnsAvailable ? "整机 = 本机全部应用流量（非仅 ZCode）" : "整机 = 本机全部应用流量";
+}
 
-  // 快照上传状态行：防护锁定 > 上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏。
-  // 防护开启时目录已清空，不可能有"上传中"；今日量是防护开启前的真实历史。
+/** 快照防护与上传记录卡：今日快照上传状态行 + 工作区名单 + 上传记录列表。
+ *  防护控制区（徽标/按钮/统计）由 guard.ts 的 renderGuard 渲染——后端无
+ *  guard 字段（浏览器预览/mock）时整块隐藏，本卡只看记录。
+ *  有防护状态或任何快照数据可显示时亮卡（与网络卡是否可用相互独立） */
+function renderSnapshot(s: Snapshot) {
+  const guardOk = !!s.guard;
+  const ckptOk =
+    s.netCkptStatus === "ok" || s.netCkptStatus === "blocked" || (s.netCkptList?.length ?? 0) > 0;
+  guardCard.hidden = !(guardOk || ckptOk);
+  guardCtl.hidden = !guardOk;
+  guardNote.hidden = !guardOk;
+
+  // 今日快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏。
+  // 防护开启时目录已清空，不可能有"上传中"；今日量是防护开启前的真实历史，
+  // 标注"防护前"（防护生效的宣告在上方 guard-stats，这里不重复 🔒）。
   // 今日有量时状态行下方逐行列出工作区名单（不去重折叠，上游 v0.4.1 交互），
   // 悬停看逐条明细——防护中同样列名单（都是防护开启前发生的真实上传）
   const renderTodayNames = (todayList: CkptStat[]) => {
-    netCkptNames.textContent = "";
-    netCkptNames.hidden = todayList.length === 0;
+    ckptNames.textContent = "";
+    ckptNames.hidden = todayList.length === 0;
     // 按工作区聚合今日快照（件数 >1 时附件数与字节小计），最新越近排越前；
     // 回补扫描顺序不保证按时间，取组内最大 recordedMs 当"最新"
     const byWs = new Map<string, CkptStat[]>();
@@ -264,62 +279,54 @@ function renderNet(s: Snapshot) {
     const groups = [...byWs.entries()].sort((a, b) => lastMs(b[1]) - lastMs(a[1]));
     for (const [ws, rows] of groups) {
       const line = document.createElement("div");
-      line.className = "net-ckpt-name";
+      line.className = "ckpt-name";
       const bytes = rows.reduce((t, r) => t + r.bytes, 0);
       line.textContent = `${ws} · ${rows.length > 1 ? `${rows.length} 个 · ` : ""}${fmtBytes(bytes)}`;
       line.title = rows
         .map((r) => `${fmtDayClock(r.recordedMs)} · ${fmtBytes(r.bytes)}`)
         .join("\n");
-      netCkptNames.append(line);
+      ckptNames.append(line);
     }
   };
-  if (s.guard?.locked) {
-    netCkptInfo.hidden = false;
-    netCkptInfo.classList.remove("uploading");
-    netCkptText.textContent =
-      s.netCkptToday > 0
-        ? `🔒 防护已开启 · 新快照落盘被阻断（今日防护前已上传 ${fmtBytes(s.netCkptToday)} · ${s.netCkptTodayCount} 个）`
-        : "🔒 防护已开启 · 新快照落盘被阻断";
-    netCkptInfo.title = "";
-    renderTodayNames(s.netCkptTodayList ?? []);
-  } else if (s.netCkptUploading) {
-    netCkptInfo.hidden = false;
-    netCkptInfo.classList.add("uploading");
-    netCkptText.textContent = "⬆ 快照上传进行中——工作区内容正整包加密上传";
-    netCkptNames.hidden = true;
+  if (s.netCkptUploading) {
+    ckptInfo.hidden = false;
+    ckptInfo.classList.add("uploading");
+    ckptText.textContent = "⬆ 快照上传进行中——工作区内容正整包加密上传";
+    ckptNames.hidden = true;
   } else if (s.netCkptStatus === "blocked") {
-    netCkptInfo.hidden = false;
-    netCkptInfo.classList.remove("uploading");
-    netCkptText.textContent = "checkpoints 目录不可读（可能已被 ACL 封锁，监控不到新上传）";
-    netCkptNames.hidden = true;
-  } else if (s.netCkptStatus === "missing") {
-    netCkptInfo.hidden = true;
-    netCkptInfo.classList.remove("uploading");
-    netCkptNames.hidden = true;
+    ckptInfo.hidden = false;
+    ckptInfo.classList.remove("uploading");
+    ckptText.textContent = "checkpoints 目录不可读（可能已被 ACL 封锁，监控不到新上传）";
+    ckptNames.hidden = true;
+  } else if (s.netCkptStatus === "missing" || s.netCkptToday === 0) {
+    ckptInfo.hidden = true;
+    ckptInfo.classList.remove("uploading");
+    ckptNames.hidden = true;
   } else {
-    netCkptInfo.hidden = s.netCkptToday === 0;
-    netCkptInfo.classList.remove("uploading");
-    netCkptText.textContent = `今日快照上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
+    ckptInfo.hidden = false;
+    ckptInfo.classList.remove("uploading");
+    ckptText.textContent = s.guard?.locked
+      ? `今日快照上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）· 均为防护开启前的记录`
+      : `今日快照上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
     const todayList: CkptStat[] = s.netCkptTodayList ?? [];
     renderTodayNames(todayList);
-    netCkptInfo.title = todayList.length
+    ckptInfo.title = todayList.length
       ? `今日已成功上传的加密快照（${todayList.length} 个）：\n${todayList
           .map((r) => `${fmtDayClock(r.recordedMs)} · ${r.workspace || "?"} · ${fmtBytes(r.bytes)}`)
           .join("\n")}`
       : "";
   }
-  netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
 
   // 快照上传记录：每工作区最近一次快照（时间 / 工作区 / 加密后大小 / 状态），
   // 上传中 > 待传 > 已接受排序（后端排好）。固定显示 5 行，其余列表内滚动
-  // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）。
+  // 看完；文字可选中复制，另有 复制/导出 按钮（见 ckpt-tools）。
   // 行尾 📂 = 在系统文件管理器中打开该快照目录（mac Finder / Win 资源管理器，
   // 跨平台；只有磁盘上真实存在的行才有——留档历史行没有）。
-  // 列表为空时右栏不能整块消失（防护清空目录后曾变 70% 空白）：
+  // 列表为空时不能静默消失（防护清空目录后曾变大片空白）：
   // 防护中给锁横幅（保留/删除两态）+ 留档历史；平时给"暂无记录"占位
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
-  netCkptList.textContent = "";
-  netCkptListHead.style.display = "";
+  ckptList.textContent = "";
+  ckptListHead.style.display = "";
   const appendRow = (r: CkptStat, cls: string, stText: string) => {
     const row = document.createElement("div");
     row.className = cls;
@@ -353,7 +360,7 @@ function renderNet(s: Snapshot) {
       });
       row.append(open);
     }
-    netCkptList.append(row);
+    ckptList.append(row);
   };
   if (ckptRows.length > 0) {
     for (const r of ckptRows) {
@@ -365,14 +372,14 @@ function renderNet(s: Snapshot) {
       // 横幅说明状态即可，不挡内容
       const banner = document.createElement("div");
       banner.className = "ckpt-empty locked";
-      banner.textContent = "🔒 防护已开启 · 以下快照已锁定保留（只读），ZCode 无法写入新快照";
-      netCkptList.prepend(banner);
+      banner.textContent = "🔒 以下快照已锁定保留（只读）· ZCode 无法写入新快照";
+      ckptList.prepend(banner);
     }
   } else if (s.guard?.locked) {
     const banner = document.createElement("div");
     banner.className = "ckpt-empty locked";
-    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定。以下为防护前的原上传记录";
-    netCkptList.append(banner);
+    banner.textContent = "🔒 快照目录已清空并锁定 · 以下为防护前的原上传记录";
+    ckptList.append(banner);
     // 防护前留档（apply 清空前保存）；旧版本未留档时退回今日已上传名单
     const history: CkptStat[] = s.guard.history?.length ? s.guard.history : s.netCkptTodayList ?? [];
     for (const r of history) {
@@ -382,10 +389,9 @@ function renderNet(s: Snapshot) {
     const empty = document.createElement("div");
     empty.className = "ckpt-empty";
     empty.textContent = "暂无快照记录（ZCode 未生成过工作区快照）";
-    netCkptList.append(empty);
+    ckptList.append(empty);
   }
   lastCkptReport = buildCkptReport(s);
-  netScope.textContent = s.netConnsAvailable ? "整机 = 本机全部应用流量（非仅 ZCode）" : "整机 = 本机全部应用流量";
 }
 
 /** 快照上传记录的纯文本报告（复制/导出共用）：表头 + 逐行 + 当日汇总 +
@@ -460,9 +466,9 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-// 复制 / 导出按钮：按钮闪 ✓ 反馈，导出路径走右下角轻提示
-const netCkptCopyBtn = $<HTMLButtonElement>("net-ckpt-copy");
-const netCkptExportBtn = $<HTMLButtonElement>("net-ckpt-export");
+// 复制 / 导出按钮（快照防护与上传记录卡）：按钮闪 ✓ 反馈，导出路径走右下角轻提示
+const ckptCopyBtn = $<HTMLButtonElement>("ckpt-copy");
+const ckptExportBtn = $<HTMLButtonElement>("ckpt-export");
 let netToolTimer = 0;
 const flashNetBtn = (btn: HTMLButtonElement, okText: string) => {
   const orig = btn.textContent;
@@ -472,12 +478,12 @@ const flashNetBtn = (btn: HTMLButtonElement, okText: string) => {
     btn.textContent = orig;
   }, 1500);
 };
-netCkptCopyBtn.addEventListener("click", async () => {
+ckptCopyBtn.addEventListener("click", async () => {
   if (!lastCkptReport) return;
   const ok = await copyText(lastCkptReport);
-  flashNetBtn(netCkptCopyBtn, ok ? "已复制 ✓" : "失败");
+  flashNetBtn(ckptCopyBtn, ok ? "已复制 ✓" : "失败");
 });
-netCkptExportBtn.addEventListener("click", () => {
+ckptExportBtn.addEventListener("click", () => {
   if (!lastCkptReport) return;
   const now = new Date();
   const p = (x: number) => x.toString().padStart(2, "0");
@@ -490,18 +496,18 @@ netCkptExportBtn.addEventListener("click", () => {
     a.download = name;
     a.click();
     URL.revokeObjectURL(a.href);
-    flashNetBtn(netCkptExportBtn, "已下载 ✓");
+    flashNetBtn(ckptExportBtn, "已下载 ✓");
     return;
   }
   tauriInvoke<string>("export_text_file", { fileName: name, text: lastCkptReport })
     .then((path) => {
       if (path) {
-        flashNetBtn(netCkptExportBtn, "已导出 ✓");
+        flashNetBtn(ckptExportBtn, "已导出 ✓");
         toast(`已导出到 ${path}`);
       }
     })
     .catch((err) => {
-      flashNetBtn(netCkptExportBtn, "失败");
+      flashNetBtn(ckptExportBtn, "失败");
       toast(`导出失败：${err}`);
       console.warn("导出失败:", err);
     });
@@ -524,6 +530,7 @@ function onSnapshot(s: Snapshot) {
   miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   miniLast.setTarget(s.lastCallTps);
   renderNet(s);
+  renderSnapshot(s);
 
   // 并发任务明细：≥2 个任务时显示（单任务时隐藏，不占版面）。
   // 一个 CLI 进程 = 一行，行值合计 = 当前速度表（文件增长按字节占比分摊）；
@@ -688,6 +695,174 @@ $("float-pet-expand").addEventListener("click", () => requestMode("full"));
 $("float-pet-cycle").addEventListener("click", () => {
   currentPetPack = petWidget.cyclePack();
   localStorage.setItem(PET_PACK_KEY, currentPetPack);
+});
+
+// ---- 模块显隐与排序（顶栏 ⚙ 设置弹窗）----
+// 模块 = 完整面板 main 里可整块开关/排序的卡片组；并发任务卡跟着仪表盘走（不单列）。
+// 默认显示 仪表盘 / 网速监控 / 近 15 分钟输出速度，快照防护与上传记录默认隐藏
+// （快照相关内容显式开启才出现）。配置存 localStorage，跨重启保持。
+type ModuleId = "gauges" | "net" | "guard" | "chart";
+const MODULE_DEFS: { id: ModuleId; name: string; desc: string }[] = [
+  { id: "gauges", name: "仪表盘", desc: "当前速度 / 今日平均 / 今日总量（多任务时含并发任务明细）" },
+  { id: "net", name: "网速监控", desc: "整机上传/下载速度 · ZCode 连接归属 · 今日累计" },
+  { id: "guard", name: "快照防护与上传记录", desc: "防护开关 · 今日快照上传 · 上传记录列表" },
+  { id: "chart", name: "近 15 分钟输出速度", desc: "10 秒一档速度曲线 · 模型详情入口" },
+];
+const MODULES_KEY = "modules.v1";
+const MODULES_DEFAULT_ORDER: ModuleId[] = ["gauges", "net", "chart", "guard"];
+const MODULES_DEFAULT_HIDDEN: ModuleId[] = ["guard"];
+
+interface ModulesConfig {
+  /** 全部模块的全局顺序（含隐藏的——重新勾选时回到原位，排序对隐藏行同样有效） */
+  order: ModuleId[];
+  /** 隐藏的模块 id */
+  hidden: ModuleId[];
+}
+
+/** 读 localStorage 并兜底清洗：JSON 损坏回默认；未知 id 剔除、缺失的按默认序补到末尾、
+ *  去重——手改/旧版本配置不致丢模块或抛错 */
+function loadModulesConfig(): ModulesConfig {
+  const fallback = (): ModulesConfig => ({
+    order: [...MODULES_DEFAULT_ORDER],
+    hidden: [...MODULES_DEFAULT_HIDDEN],
+  });
+  try {
+    const raw = localStorage.getItem(MODULES_KEY);
+    if (!raw) return fallback();
+    const parsed = JSON.parse(raw) as Partial<{ order: unknown; hidden: unknown }>;
+    const known = new Set<string>(MODULES_DEFAULT_ORDER);
+    const clean = (v: unknown): ModuleId[] => [
+      ...new Set(Array.isArray(v) ? v.filter((x): x is ModuleId => typeof x === "string" && known.has(x)) : []),
+    ];
+    const order = clean(parsed.order);
+    for (const id of MODULES_DEFAULT_ORDER) if (!order.includes(id)) order.push(id);
+    return { order, hidden: clean(parsed.hidden) };
+  } catch {
+    return fallback();
+  }
+}
+
+const moduleWraps = new Map<ModuleId, HTMLElement>(
+  MODULE_DEFS.map((m) => [m.id, document.querySelector<HTMLElement>(`.module-wrap[data-module="${m.id}"]`)!]),
+);
+const mainEl = document.querySelector("main")!;
+const footerEl = $("statusbar");
+const modulesEmpty = $("modules-empty");
+let modulesCfg = loadModulesConfig();
+
+/** 按配置重排/隐藏模块：wrapper 为 display:contents，卡片仍是 main 的 flex 项，
+ *  顺序 = order 数组过滤隐藏项；footer 恒在最后。全部隐藏时给占位提示（顶栏 ⚙
+ *  始终可再打开，但空白页不解释会像坏了）。网速/快照卡自身还带数据可用性的
+ *  hidden 逻辑（renderNet/renderSnapshot），与模块开关相互独立、取交集显示 */
+function applyModules() {
+  for (const id of modulesCfg.order) {
+    const wrap = moduleWraps.get(id);
+    if (!wrap) continue;
+    mainEl.insertBefore(wrap, footerEl);
+    wrap.hidden = modulesCfg.hidden.includes(id);
+  }
+  modulesEmpty.hidden = modulesCfg.order.some((id) => !modulesCfg.hidden.includes(id));
+  mainEl.insertBefore(modulesEmpty, footerEl);
+}
+
+const saveModulesConfig = () => {
+  localStorage.setItem(MODULES_KEY, JSON.stringify(modulesCfg));
+};
+applyModules();
+
+// ---- 设置弹窗：自绘勾选（.pet-chk 同款，禁原生 checkbox）+ ↑↓ 排序，即时生效 ----
+const settingsModal = $("settings-modal");
+const settingsList = $("settings-modules");
+const setSettingsOpen = (open: boolean) => {
+  settingsModal.style.display = open ? "flex" : "none";
+};
+
+function renderSettingsRows() {
+  settingsList.textContent = "";
+  modulesCfg.order.forEach((id, idx) => {
+    const def = MODULE_DEFS.find((m) => m.id === id)!;
+    const shown = !modulesCfg.hidden.includes(id);
+    const row = document.createElement("div");
+    row.className = shown ? "settings-row" : "settings-row off";
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = `ghost-btn settings-toggle${shown ? " on" : ""}`;
+    toggle.title = shown ? "隐藏该模块" : "显示该模块";
+    const chk = document.createElement("span");
+    chk.className = "pet-chk";
+    chk.setAttribute("aria-hidden", "true");
+    toggle.append(chk, document.createTextNode("显示"));
+    toggle.addEventListener("click", () => {
+      modulesCfg.hidden = shown
+        ? [...modulesCfg.hidden, id]
+        : modulesCfg.hidden.filter((x) => x !== id);
+      saveModulesConfig();
+      applyModules();
+      renderSettingsRows();
+    });
+
+    const info = document.createElement("div");
+    info.className = "settings-info";
+    const name = document.createElement("span");
+    name.className = "settings-name";
+    name.textContent = def.name;
+    const desc = document.createElement("span");
+    desc.className = "settings-desc";
+    desc.textContent = def.desc;
+    info.append(name, desc);
+
+    const move = (dir: -1 | 1) => {
+      const j = idx + dir;
+      if (j < 0 || j >= modulesCfg.order.length) return;
+      [modulesCfg.order[idx], modulesCfg.order[j]] = [modulesCfg.order[j], modulesCfg.order[idx]];
+      saveModulesConfig();
+      applyModules();
+      renderSettingsRows();
+    };
+    const up = document.createElement("button");
+    up.type = "button";
+    up.className = "ghost-btn settings-move";
+    up.textContent = "↑";
+    up.title = "上移";
+    up.disabled = idx === 0;
+    up.addEventListener("click", () => move(-1));
+    const down = document.createElement("button");
+    down.type = "button";
+    down.className = "ghost-btn settings-move";
+    down.textContent = "↓";
+    down.title = "下移";
+    down.disabled = idx === modulesCfg.order.length - 1;
+    down.addEventListener("click", () => move(1));
+    const orderBtns = document.createElement("div");
+    orderBtns.className = "settings-order";
+    orderBtns.append(up, down);
+
+    row.append(toggle, info, orderBtns);
+    settingsList.append(row);
+  });
+}
+
+$("btn-settings").addEventListener("click", () => {
+  renderSettingsRows();
+  setSettingsOpen(true);
+});
+$("settings-close").addEventListener("click", () => setSettingsOpen(false));
+$("settings-reset").addEventListener("click", () => {
+  modulesCfg = {
+    order: [...MODULES_DEFAULT_ORDER],
+    hidden: [...MODULES_DEFAULT_HIDDEN],
+  };
+  saveModulesConfig();
+  applyModules();
+  renderSettingsRows();
+});
+// 点遮罩空白处 / Esc 关闭（与模型详情、防护确认弹窗同一习惯）
+settingsModal.addEventListener("mousedown", (e) => {
+  if (e.target === settingsModal) setSettingsOpen(false);
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && settingsModal.style.display === "flex") setSettingsOpen(false);
 });
 
 // ---- 重新校准（当前速度卡左上角 ⟳）：丢弃字节→token 系数样本回到先验 ----
