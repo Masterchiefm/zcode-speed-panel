@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod liveio;
 mod metrics;
 mod netio;
@@ -1301,6 +1302,22 @@ fn app_version(app: AppHandle) -> String {
     current_version(&app)
 }
 
+// ---- 自动启动（autostart.rs）：设置弹窗「自动启动」区的读写命令 ----
+// 注册表 / LaunchAgent 即事实源，get 回读真实状态（不信任前端缓存）
+
+#[tauri::command]
+fn autostart_get() -> String {
+    autostart::current_mode().as_str().to_string()
+}
+
+/// 返回实际生效的模式（写后回读，失败把错误如实带给前端）
+#[tauri::command]
+fn autostart_set(mode: String) -> Result<String, String> {
+    let parsed = autostart::AutostartMode::parse(&mode);
+    autostart::set_mode(parsed)?;
+    Ok(autostart::current_mode().as_str().to_string())
+}
+
 /// 导出文本文件（快照上传记录等前端生成的报告）：写入
 /// `~/.zcode/speed-panel-exports/<file_name>`，返回完整路径供前端提示。
 /// 文件名做白名单清洗（只留字母数字._-，防路径注入/穿越）
@@ -1527,6 +1544,8 @@ fn main() {
             app_version,
             export_text_file,
             open_url,
+            autostart_get,
+            autostart_set,
             snapshot_guard_status,
             snapshot_guard_apply,
             snapshot_guard_release,
@@ -1637,7 +1656,29 @@ fn main() {
             let p = app.state::<AppState>().persist.lock().unwrap().clone();
             let pet_extra = *app.state::<AppState>().pet_task_extra.lock().unwrap();
             apply_mode(&window, mode, style, &p, pet_extra);
-            let _ = window.show();
+            // 跟随 ZCode 启动（autostart.rs follow 模式，开机带 --zcode-follow）：
+            // 静默待命——不亮窗口只留托盘，由检测线程在发现 ZCode 进程后唤起。
+            // 单实例插件保证该参数只对"开机第一个实例"生效（已有实例时本进程
+            // 到不了 setup，唤起回调直接 show 旧实例窗口）
+            let follow_boot = autostart::follow_requested();
+            if follow_boot {
+                eprintln!("[zcode-speed-panel] 跟随 ZCode 启动：静默待命（托盘常驻）");
+                let watch = app.handle().clone();
+                std::thread::spawn(move || {
+                    // 开机瞬间系统忙，先歇 3s 再开始检测
+                    std::thread::sleep(Duration::from_secs(3));
+                    loop {
+                        if autostart::zcode_running() {
+                            eprintln!("[zcode-speed-panel] 检测到 ZCode 进程，亮出面板");
+                            show_main(&watch);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                });
+            } else {
+                let _ = window.show();
+            }
             // mac 启动引导提示不在此 emit：setup 早于事件循环/WKWebView 加载，
             // 发即被弃——改为前端就绪后 invoke `tray_hint_once` 领取（一次性）
 

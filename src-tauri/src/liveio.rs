@@ -750,6 +750,50 @@ pub mod platform {
             pids
         }
 
+        /// 系统里是否存在任意 ZCode 进程（进程名 zcode.exe，桌面端壳与 CLI
+        /// 子进程同名——不读命令行，名字匹配即算）。供自动启动 follow 模式
+        /// 的待命检测用（autostart.rs）：桌面端或 CLI 任一在跑都算「ZCode
+        /// 正在运行」。与 discover_cli_pids 的区别：那要读命令行精确过滤
+        /// CLI 子进程，这里只要名字命中，更快也更宽
+        pub fn any_zcode_process() -> bool {
+            unsafe {
+                let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                if snap == -1 {
+                    return false;
+                }
+                let mut entry = ProcessEntry32W {
+                    size: std::mem::size_of::<ProcessEntry32W>() as u32,
+                    usage: 0,
+                    process_id: 0,
+                    default_heap_id: 0,
+                    module_id: 0,
+                    threads: 0,
+                    parent_process_id: 0,
+                    pri_class_base: 0,
+                    flags: 0,
+                    exe_file: [0; 260],
+                };
+                let mut found = false;
+                let ok = Process32FirstW(snap, &mut entry);
+                if ok != 0 {
+                    loop {
+                        let end = entry.exe_file.iter().position(|c| *c == 0).unwrap_or(260);
+                        if String::from_utf16_lossy(&entry.exe_file[..end])
+                            .eq_ignore_ascii_case("zcode.exe")
+                        {
+                            found = true;
+                            break;
+                        }
+                        if Process32NextW(snap, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snap as *mut c_void);
+                found
+            }
+        }
+
         pub fn io_write_bytes(h: &ProcHandle) -> Option<u64> {
             let mut io = IoCounters {
                 read_ops: 0,
@@ -991,6 +1035,57 @@ pub mod platform {
             false
         }
 
+        /// 系统里是否存在任意 ZCode 进程（桌面端或 CLI 任一即算）。
+        /// 供自动启动 follow 模式的待命检测用（autostart.rs）
+        pub fn any_zcode_process() -> bool {
+            unsafe {
+                let n = proc_listallpids(std::ptr::null_mut(), 0);
+                if n <= 0 {
+                    return false;
+                }
+                let cap = (n + 16) as usize;
+                let mut buf = vec![0i32; cap];
+                let m = proc_listallpids(buf.as_mut_ptr().cast::<c_void>(), (cap * 4) as c_int);
+                if m <= 0 {
+                    return false;
+                }
+                let mut scratch = vec![0u8; 64 * 1024];
+                for pid in &buf[..m as usize] {
+                    if *pid > 0 && proc_is_zcode(*pid as u32, &mut scratch) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        /// KERN_PROCARGS2 判定「ZCode 进程」：argv[0]（可执行路径，紧跟 4 字节
+        /// nargs 头的第一个 NUL 结尾串）以 /ZCode 结尾 = 桌面端主进程；
+        /// 参数区含精确串 zcode-cli = CLI 子进程（复用 discover 的口径）
+        fn proc_is_zcode(pid: u32, buf: &mut [u8]) -> bool {
+            let mib = [CTL_KERN, KERN_PROCARGS2, pid as c_int];
+            let mut len = buf.len();
+            let ok = unsafe {
+                sysctl(
+                    mib.as_ptr(),
+                    3,
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ok != 0 || len < 4 {
+                return false;
+            }
+            if let Some(end) = buf[4..len].iter().position(|b| *b == 0).map(|p| p + 4) {
+                if buf[4..end].to_ascii_lowercase().ends_with(b"/zcode") {
+                    return true;
+                }
+            }
+            argv_has_cli_marker(pid, buf)
+        }
+
         pub fn open_proc(pid: u32) -> Option<ProcHandle> {
             let ru = read_rusage(pid)?;
             Some(ProcHandle {
@@ -1023,6 +1118,9 @@ pub mod platform {
 
         pub fn discover_cli_pids() -> Vec<u32> {
             Vec::new()
+        }
+        pub fn any_zcode_process() -> bool {
+            false
         }
         pub fn open_proc(_pid: u32) -> Option<ProcHandle> {
             None

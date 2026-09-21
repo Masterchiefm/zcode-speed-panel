@@ -18,6 +18,10 @@ chrono = "0.4"
 # 应用内更新：同步阻塞式 HTTP 客户端（rustls，无 OpenSSL 依赖，mac 交叉构建友好）
 ureq = { version = "2", features = ["json"] }
 
+# 自动启动（autostart.rs）：HKCU Run 注册表读写，仅 Windows
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
 [profile.release]
 codegen-units = 1
 lto = true
