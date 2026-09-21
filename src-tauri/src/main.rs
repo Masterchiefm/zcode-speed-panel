@@ -860,6 +860,16 @@ fn model_stats(app: AppHandle, window_min: i64) -> ModelStatsPayload {
     engine.model_stats(window_min)
 }
 
+/// 输出速度曲线（时间范围可选 15m/1h/6h/24h）：只读查询 usage 库聚合 90 桶
+/// tps（全部模型合并，旧→新）。15 分钟档与 metrics payload 里的今日 spark
+/// 数据同口径；前端长档位时每 5s 拉取，并把实时速度混入最新桶
+#[tauri::command]
+fn chart_stats(app: AppHandle, window_min: i64) -> metrics::ChartStatsPayload {
+    let state = app.state::<AppState>();
+    let engine = state.engine.lock().unwrap();
+    engine.chart_stats(window_min)
+}
+
 #[tauri::command]
 fn set_mode(app: AppHandle, mode: String, style: Option<String>) {
     if let Some(s) = style {
@@ -1515,6 +1525,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             model_stats,
+            chart_stats,
             set_mode,
             set_float_style,
             set_float_size,

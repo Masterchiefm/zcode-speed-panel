@@ -62,6 +62,10 @@ const gTotal = new ArcGauge($("g-total"), {
 
 // 当前速度卡右上角小表：最近一轮已完成调用的速度（落盘口径，非实时）
 const gLast = new BadgeGauge($("g-last"), { tiers: SPEED_TIERS });
+// 当前速度卡右下角小表：历史最高单调用速度（准入口径见 tooltip 与 metrics.rs）
+const gPeak = new BadgeGauge($("g-peak"), { tiers: SPEED_TIERS, label: "最高" });
+// 今日平均卡右上角小表：历史平均速度（全部调用 Σeff ÷ Σgen，与今日平均同口径）
+const gHistAvg = new BadgeGauge($("g-histavg"), { tiers: SPEED_TIERS, label: "历史" });
 
 const miniGauge = new MiniGauge($("mini-gauge"), { tiers: SPEED_TIERS });
 // 仪表悬浮窗右上角的上轮小环（与完整面板角标同款，只是尺寸更小）
@@ -197,13 +201,71 @@ const floatLast = $("float-last");
 let lastSpark: number[] = [];
 let lastNowMs = 0;
 let sparkColor = "#22d3ee";
+// ---- 曲线时间范围（15m/1h/6h/24h，默认 15 分钟，localStorage 记住选择）----
+// 15 分钟档走 metrics payload 的今日 spark（后端把实时速度混入尾桶，零额外
+// 查询）；更长档位走 chart_stats 命令（usage 库现算 90 桶，5s 拉取一次），
+// 前端把实时速度混入最新桶——两档尾桶口径一致，切换无跳变
+type ChartRange = 15 | 60 | 360 | 1440;
+const CHART_RANGES: { value: ChartRange; label: string; bucketLabel: string; gridMs: number }[] = [
+  { value: 15, label: "15 分钟", bucketLabel: "10 秒一档", gridMs: 5 * 60_000 },
+  { value: 60, label: "1 小时", bucketLabel: "40 秒一档", gridMs: 10 * 60_000 },
+  { value: 360, label: "6 小时", bucketLabel: "4 分钟一档", gridMs: 60 * 60_000 },
+  { value: 1440, label: "24 小时", bucketLabel: "16 分钟一档", gridMs: 4 * 3_600_000 },
+];
+const CHART_RANGE_KEY = "chartRange.v1";
+const storedChartRange = Number(localStorage.getItem(CHART_RANGE_KEY));
+let chartRange: ChartRange = CHART_RANGES.some((r) => r.value === storedChartRange)
+  ? (storedChartRange as ChartRange)
+  : 15;
+let chartCache: { buckets: number[]; bucketMs: number; nowMs: number } | null = null;
+let chartTimer = 0;
+// 最新一拍的实时状态（长档位尾桶混入用）
+let liveTpsNow = 0;
+let liveActive = false;
+
+function chartRangeCfg(): (typeof CHART_RANGES)[number] {
+  return CHART_RANGES.find((r) => r.value === chartRange) ?? CHART_RANGES[0];
+}
+
+/** 长档位数据拉取：失败静默保留旧缓存（浏览器预览无 Tauri 同样静默） */
+async function refreshChartStats() {
+  const p = await tauriInvoke<{
+    windowMin: number;
+    bucketMs: number;
+    nowMs: number;
+    buckets: number[];
+  }>("chart_stats", { windowMin: chartRange });
+  if (p && p.windowMin === chartRange) {
+    chartCache = { buckets: p.buckets, bucketMs: p.bucketMs, nowMs: p.nowMs };
+    redrawSpark();
+  }
+}
+
+function redrawSpark() {
+  if (chartRange === 15) {
+    if (lastSpark.length) drawSpark(sparkCanvas, lastSpark, sparkColor, lastNowMs);
+    return;
+  }
+  if (chartCache && chartCache.buckets.length >= 2) {
+    const values = chartCache.buckets.slice();
+    // 实时尾桶混入（与 15 分钟档后端行为一致）：生成/估算中把最新桶临时填成
+    // 当前速度，下一轮 5s 拉取被真实落盘数据替换
+    if (liveActive && liveTpsNow > 0) values[values.length - 1] = liveTpsNow;
+    drawSpark(sparkCanvas, values, sparkColor, lastNowMs, {
+      bucketMs: chartCache.bucketMs,
+      gridMs: chartRangeCfg().gridMs,
+    });
+    return;
+  }
+  // 浏览器预览（无 Tauri）：长档位暂无数据源，沿用 15 分钟 mock 数据画样式
+  if (!hasTauri && lastSpark.length) {
+    drawSpark(sparkCanvas, lastSpark, sparkColor, lastNowMs, { gridMs: chartRangeCfg().gridMs });
+  }
+}
+
 // 任务卡隐藏迟滞：任务数在 1↔2 边界抖动（子代理起止、流式阈值边缘）时，
 // 连续 3 拍（~2s）不足 2 行才隐藏，避免下方曲线卡整块上下跳
 let taskHideStreak = 3;
-
-function redrawSpark() {
-  if (lastSpark.length) drawSpark(sparkCanvas, lastSpark, sparkColor, lastNowMs);
-}
 
 function statusClass(s: Snapshot): string {
   if (s.isLive || s.isStarting) return "dot live";
@@ -526,6 +588,8 @@ function onSnapshot(s: Snapshot) {
   gCurrent.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   gAvg.setTarget(s.avgTps);
   gLast.setTarget(s.lastCallTps);
+  gPeak.setTarget(s.histMaxTps);
+  gHistAvg.setTarget(s.histAvgTps);
   gTotal.setTarget(s.totalTokens);
   miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   miniLast.setTarget(s.lastCallTps);
@@ -630,13 +694,77 @@ function onSnapshot(s: Snapshot) {
 
   lastSpark = s.spark;
   lastNowMs = s.nowMs;
+  liveTpsNow = s.currentTps;
+  liveActive = s.isLive || s.isEstimating;
   sparkColor = s.isLive ? "#22d3ee" : s.isEstimating ? "#fbbf24" : "#64748b";
-  const peak = Math.max(10, ...s.spark, s.currentTps);
+  // 峰值标签按当前展示的档位取数（15m = payload spark；长档位 = 5s 缓存 + 实时）
+  const shown = chartRange === 15 ? s.spark : (chartCache?.buckets ?? []);
+  const peak = Math.max(10, ...shown, s.currentTps);
   chartMax.textContent = `峰值 ${fmtTps(peak)} t/s`;
   redrawSpark();
 }
 
 window.addEventListener("resize", redrawSpark);
+
+// ---- 曲线时间范围下拉（自绘 dropdown，与悬浮窗样式下拉同款交互）----
+const chartDropdown = $("chart-window");
+const chartRangeOptions = Array.from(
+  $<HTMLElement>("chart-window-list").querySelectorAll<HTMLButtonElement>("button[data-value]"),
+);
+
+function applyChartRangeUi() {
+  const cfg = chartRangeCfg();
+  $("chart-window-label").textContent = cfg.label;
+  $("chart-title").textContent = `近 ${cfg.label}输出速度（${cfg.bucketLabel} · token/s，横轴为真实时刻）`;
+  for (const opt of chartRangeOptions) {
+    opt.classList.toggle("selected", Number(opt.dataset.value) === chartRange);
+  }
+}
+
+function setChartDropdownOpen(open: boolean) {
+  chartDropdown.classList.toggle("open", open);
+  $<HTMLButtonElement>("chart-window-btn").setAttribute("aria-expanded", String(open));
+}
+
+function selectChartRange(r: ChartRange) {
+  if (r === chartRange) {
+    setChartDropdownOpen(false);
+    return;
+  }
+  setChartDropdownOpen(false);
+  chartRange = r;
+  localStorage.setItem(CHART_RANGE_KEY, String(r));
+  if (r === 15) chartCache = null;
+  applyChartRangeUi();
+  window.clearInterval(chartTimer);
+  chartTimer = 0;
+  if (r !== 15) {
+    void refreshChartStats();
+    chartTimer = window.setInterval(() => void refreshChartStats(), 5000);
+  }
+  redrawSpark();
+}
+
+$<HTMLButtonElement>("chart-window-btn").addEventListener("click", () =>
+  setChartDropdownOpen(!chartDropdown.classList.contains("open")),
+);
+for (const opt of chartRangeOptions) {
+  opt.addEventListener("click", () => selectChartRange(Number(opt.dataset.value) as ChartRange));
+}
+window.addEventListener("mousedown", (e) => {
+  if (chartDropdown.classList.contains("open") && !chartDropdown.contains(e.target as Node)) {
+    setChartDropdownOpen(false);
+  }
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && chartDropdown.classList.contains("open")) setChartDropdownOpen(false);
+});
+// 启动恢复上次选择的档位（长档位立即拉取一次并起 5s 定时器）
+applyChartRangeUi();
+if (chartRange !== 15) {
+  void refreshChartStats();
+  chartTimer = window.setInterval(() => void refreshChartStats(), 5000);
+}
 
 // ---- 模式与悬浮窗样式（自绘下拉，替代原生 select：WebView2 弹层在浅色系统主题下看不清） ----
 function applyModeUi(mode: string) {
@@ -706,7 +834,7 @@ const MODULE_DEFS: { id: ModuleId; name: string; desc: string }[] = [
   { id: "gauges", name: "仪表盘", desc: "当前速度 / 今日平均 / 今日总量（多任务时含并发任务明细）" },
   { id: "net", name: "网速监控", desc: "整机上传/下载速度 · ZCode 连接归属 · 今日累计" },
   { id: "guard", name: "快照防护与上传记录", desc: "防护开关 · 今日快照上传 · 上传记录列表" },
-  { id: "chart", name: "近 15 分钟输出速度", desc: "10 秒一档速度曲线 · 模型详情入口" },
+  { id: "chart", name: "输出速度曲线", desc: "近 15 分钟 / 1 小时 / 6 小时 / 24 小时速度曲线 · 模型详情入口" },
 ];
 const MODULES_KEY = "modules.v1";
 const MODULES_DEFAULT_ORDER: ModuleId[] = ["gauges", "net", "chart", "guard"];

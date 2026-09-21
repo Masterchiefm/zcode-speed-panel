@@ -83,10 +83,20 @@
               class="corner-gauge"
               title="上一轮调用速度：最近一次已完成调用（输出+思考 ÷ 纯生成时长，落盘口径）"
             ></canvas>
-            <div class="sub" id="sub-current">等待数据…</div>
+            <canvas
+              id="g-peak"
+              class="corner-gauge corner-bottom"
+              title="历史最高速度：有效输出 ≥300 token 且纯生成 ≥1s 的调用中最快一次（毫秒级小调用时间戳噪声大，不计入记录）"
+            ></canvas>
+            <div class="sub sub-badge" id="sub-current">等待数据…</div>
           </div>
           <div class="card gauge-card">
             <canvas id="g-avg"></canvas>
+            <canvas
+              id="g-histavg"
+              class="corner-gauge"
+              title="历史平均速度：全部已完成调用 Σ(输出+思考) ÷ Σ纯生成时长（与今日平均同口径，不过滤）"
+            ></canvas>
             <div class="sub" id="sub-avg">等待数据…</div>
           </div>
           <div class="card gauge-card">
@@ -202,8 +212,20 @@
         <div class="module-wrap" data-module="chart">
         <section class="card chart-card">
           <div class="chart-head">
-            <span>近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
+            <span id="chart-title">近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
             <span class="chart-head-right">
+              <div id="chart-window" class="dropdown" title="曲线时间范围（默认 15 分钟，记住选择）">
+                <button id="chart-window-btn" class="ghost-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+                  <span id="chart-window-label">15 分钟</span>
+                  <span class="caret">▾</span>
+                </button>
+                <div id="chart-window-list" class="dropdown-list" role="listbox" aria-label="曲线时间范围">
+                  <button type="button" role="option" data-value="15" class="selected">15 分钟</button>
+                  <button type="button" role="option" data-value="60">1 小时</button>
+                  <button type="button" role="option" data-value="360">6 小时</button>
+                  <button type="button" role="option" data-value="1440">24 小时</button>
+                </div>
+              </div>
               <span id="chart-max" class="dim">峰值 0</span>
               <button id="btn-model-stats" class="ghost-btn" type="button" title="按模型分类的速度趋势与统计（最近 10 分钟 / 1 小时 / 6 小时）">模型详情</button>
             </span>

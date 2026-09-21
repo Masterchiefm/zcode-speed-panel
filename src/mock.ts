@@ -52,6 +52,10 @@ export interface Snapshot {
   windowTps: number;
   /** 最近一次已完成调用的真实速度（落盘口径），当前速度卡右上角小表用 */
   lastCallTps: number;
+  /** 历史最高单调用速度（准入口径见 metrics.rs；mock 给个合理峰值） */
+  histMaxTps: number;
+  /** 历史平均速度（全部调用 Σeff ÷ Σgen，与今日平均同口径） */
+  histAvgTps: number;
   liveSource: string;
   lastActivityMs: number;
   nowMs: number;
@@ -243,6 +247,9 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     ramping: isLive && ageSec < 30,
     windowTps: wDur > 0 ? wOut / (wDur / 1000) : 0,
     lastCallTps: lastTps,
+    // 历史统计 mock：峰值为今日峰值 × 1.2、历史平均略低于今日平均（长周期稀释）
+    histMaxTps: Math.max(...spark, lastTps) * 1.2 || 312,
+    histAvgTps: dur > 0 ? (out / (dur / 1000)) * 0.92 : 0,
     liveSource: isStarting || isLive ? "io" : isEstimating ? "window" : "idle",
     lastActivityMs: last,
     nowMs: now,
