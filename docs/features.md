@@ -161,6 +161,22 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - **实现口径**：每模块包一层 `.module-wrap[data-module]`，`display: contents` 不参与布局——卡片仍是 `main` 的直接 flex 项，卡片间距（gap 14px）与曲线卡的 `flex:1` 拉伸口径不变；`applyModules()` 按配置把 wrapper 依次 `insertBefore` footer（footer 恒在最后）并设 `hidden`（文件顶部的全局 `[hidden]!important` 兜底）。**全部模块隐藏时显示占位提示**「所有模块都已隐藏 · 点顶栏 ⚙ 重新开启」（不静默空白，同 key-rules #16 精神）。网速/快照卡自身还带数据可用性的 hidden（`renderNet`/`renderSnapshot`），与模块开关相互独立、取交集显示。
 - 模块开关只影响完整面板；悬浮窗/桌宠/胶囊与状态栏不受影响。
 
+## 自动启动（autostart.rs）
+
+设置弹窗（顶栏 ⚙）的第二个分区，与「显示模块」并列，三态单选：**off**（关闭，默认）/ **boot**（登录后常驻启动，按 `~/.zcode/speed-panel-mode.txt` 里上次的形态显示）/ **follow**（登录后静默待命，检测到 ZCode 即亮出面板）。**注册表 / plist 即唯一事实源**——不写任何本地配置文件，界面每次打开回读真实状态；手动改注册表或删 plist 都会如实落回 off（`AutostartMode::parse` 未知值一律 Off），避免两处状态漂移。
+
+| 平台 | 落点 | 内容 |
+|---|---|---|
+| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `zcode-speed-panel` | REG_SZ = `"<exe 全路径>" [--zcode-follow]`（带引号，免安装版挪到含空格路径后不被截断；免管理员；`winreg` 是仅 Windows 目标的依赖） |
+| macOS | `~/Library/LaunchAgents/com.zcode.speedpanel.autostart.plist` | 手写 XML（无 plist 依赖）：`ProgramArguments` = exe +（follow 时）`--zcode-follow`，`RunAtLoad=true`；off = 直接删除该文件 |
+
+- **follow 模式**：自启动命令行带 `--zcode-follow`，`main.rs` setup 见到该参数**跳过 `window.show()`**（只留托盘常驻、不亮窗），另起检测线程——先歇 3s 避开登录高峰，之后每 2s 调 `liveio::platform::any_zcode_process()`，命中即 `show_main` 并退出线程（亮出后不再自动隐藏）。面板**手动退出后不会自动复活**（重新登录或手动打开恢复）——单实例架构的自然边界，设置界面已写明。
+- **进程判定口径**（`any_zcode_process()`，liveio.rs platform 子模块）：Windows 用 Toolhelp32 枚举按**进程名 `zcode.exe`** 匹配——**故意不读命令行**，桌面壳与 CLI 子进程同名，名字命中即算，比 `discover_cli_pids` 更快也更宽；macOS 按 `KERN_PROCARGS2` 的 argv[0] 以 `/ZCode` 结尾（桌面端）或参数区含 `zcode-cli`（CLI，与 `discover_cli_pids` 同口径）。
+- **与单实例的关系**：`--zcode-follow` 只在开机无实例时生效——带参启动撞上已有实例会被 `tauri-plugin-single-instance` 拦下并走唤起回调直接 show 旧窗口，所以手动二次启动不会误判为静默待命。
+- **前端**：三行复用 `settings-row` + `.pet-chk` 自绘勾选（单选语义）；写入失败行内报错并回滚选中态；弹窗加 `max-height` + 滚动防小屏溢出；浏览器预览（无 Tauri）只展示不可写。
+- **测试**：`parse_roundtrip`（三态 + 未知值回 Off）与 Windows `registry_enable_disable_cycle` 端到端（真实读写 HKCU，测完恢复原值、不留副作用）。
+- **边界**：macOS 分支（plist 写入与 `any_zcode_process` 的 KERN_PROCARGS2 判定）**只过 `cargo check`、未实机验证**——LaunchAgent 直接执行 `.app` 内的二进制而非走 `open -a`，应用身份与 Dock 两态是否与手动启动一致需实机确认；Windows 侧注册表三态与 follow 唤醒已实机验证。
+
 ## 悬浮窗与桌宠
 
 - 三形态：**桌宠**（默认精灵区 200×200，窗口为 200×256——顶部 56px 气泡预留带 `PET_BUBBLE_RESERVE`；**多任务（≥2 进程，连续 3 拍防抖）期间自动向上加高 96px**（`PET_TASK_EXTRA`，位置同步上移保持精灵底边不动，约 2s 收回），默认尺寸下可容纳 实时+6 任务+上轮 共 8 行；改桌宠窗口尺寸口径须同步 `apply_mode`/`set_float_size`/`apply_pet_size` 与 `pet.ts` 排版；默认宠物鲸鱼女仆 maid-deepseek-whale）/ **迷你仪表**（148×148 正方形，主环量程与完整面板当前速度表一致：最小 60 t/s）/ **速度胶囊**（172×72）。完整面板右上角**自绘下拉**切换（深色弹层，点击选项/外部、Esc、窗口失焦均关闭；原生 `<select>` 因 WebView2 弹层跟随系统浅色主题不可读而弃用，见 key-rules #8），选择持久化。
@@ -205,6 +221,8 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 | `~/.zcode/speed-panel-ckpt-history.json` | 防护前的原上传记录留档（apply 清空前写入，同工作区新行覆盖，上限 500 行；防护期间列表/报告回看） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
+自动启动状态**不落本地文件**——Windows 注册表 `HKCU\…\Run` / macOS LaunchAgent plist 即事实源（见「自动启动」节）。
+
 ## 应用内更新（updater.rs）
 
 - **版本号**：来源 `tauri.conf.json` 的 `version`（与 `Cargo.toml`/`package.json` 三处同值，发版一起 bump），运行时读 `app.package_info().version`。完整面板状态栏最右显示（如 `v0.2.1`；悬浮窗/桌宠形态与浏览器 mock 模式下隐藏），**点击即手动检查更新**——检查中前缀 ↻ 旋转，结果以右下角轻提示反馈（"已是最新版本 vX.Y.Z" / "检查更新失败：网络异常"）。
@@ -232,3 +250,4 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - 硬崩溃（CLI 进程被杀、assistant 行无人补写 `completed`）最多残留 10 分钟门控（兜底上限）；已归属会话的进程退出会被进程守卫立即判停，未归属的新会话只能等兜底。
 - mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 700/延迟落盘宽限 15s/离群拒绝 3 倍）中，先验与宽限已按 2026-09-17 的 6 条 cal 事件真值对账修正（归因正确时 pred/true 完全一致 62.1=62.1），尚未做 Windows 侧同等长度的对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账、看 cal 事件 `attr_pid`/`top_pid` 归因再调参（key-rules #10）。
 - 应用内更新能力**随版本生效**：只有装了含 updater.rs 版本的用户才会收到后续更新提示，存量旧版本需手动升级一次铺底；dev 实例（`npm run tauri dev`）同样做真实检查与下载——版本等于最新 Release tag 时显示"已是最新"，属预期（热重启每次都会触发一次启动检查，量级远低于 API 限流）。
+- 自动启动的 macOS 分支**未实机验证**（只过 `cargo check`）：LaunchAgent 直接跑 `.app` 内二进制而非 `open -a`，应用身份/Dock 两态需实机确认；follow 模式下面板手动退出后不会自动复活，需重新登录或手动打开（见"自动启动"节）。
