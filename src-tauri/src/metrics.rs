@@ -109,6 +109,13 @@ pub struct Snapshot {
     /// 最近一次已完成调用的真实速度（落盘口径：输出+思考 ÷ 纯生成时长）。
     /// 今日无已完成调用时为 0；当前速度卡右上角的小表用它显示"上一轮"
     pub last_call_tps: f64,
+    /// 历史最高单调用速度（t/s）。准入口径见 HistoryStats（有效 first_token、
+    /// 纯生成 ≥1s、有效输出 ≥300 token——毫秒级小调用时间戳噪声大，不入记录）。
+    /// 无合格调用时为 0；当前速度卡右下角小表"最高"显示
+    pub hist_max_tps: f64,
+    /// 历史平均速度：全部已完成调用 Σeff ÷ Σgen_s（与今日平均同口径，不过滤）。
+    /// 今日平均卡右上角小表"历史"显示
+    pub hist_avg_tps: f64,
     /// 当前速度来源："io"=进程流实测 / "window"=窗口回退 / "idle"=待机
     pub live_source: String,
     pub last_activity_ms: i64,
@@ -193,6 +200,61 @@ pub struct Aggregator {
     pub calls: Vec<Call>,
     pub today_ymd: (i32, u32, u32),
 }
+
+/// 历史统计（全时段）：启动时对 usage 库做一次基线扫描（今日之前全部行），
+/// 之后随 poll 增量累计，跨天不重置。历史平均与今日平均同口径（不过滤）；
+/// 历史最高带准入门槛——实测库中 24ms/79 token 一类小调用的毫秒级时间戳
+/// 噪声可产出上千 t/s 的假记录（与校准样本排除 <300 token 调用同理）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HistoryStats {
+    /// 全部已完成调用 Σeff（历史平均分子）
+    pub total_eff: u64,
+    /// 全部已完成调用 Σgen_ms（历史平均分母；first_token 缺失退 duration 再 max(50)）
+    pub total_gen_ms: i64,
+    /// 历史最高单调用速度（t/s）：仅计入有效 first_token、gen≥1s 且 eff≥300 的调用
+    pub max_tps: f64,
+}
+
+/// 历史最高准入：纯生成时长下限（ms）——短调用时间戳噪声大
+const HIST_MAX_MIN_GEN_MS: i64 = 1000;
+/// 历史最高准入：有效输出 token 下限（与校准样本准入同值）
+const HIST_MAX_MIN_EFF: u64 = 300;
+
+impl HistoryStats {
+    /// 累计一次已完成调用（基线扫描与每拍增量共用）。gen_ms 为 poll 口径的
+    /// 最终值（ft 有效取 completed-ft，否则 duration 兜底再 max(50)）
+    pub fn fold(&mut self, ft: Option<i64>, completed_ms: i64, gen_ms: i64, eff: u64) {
+        self.total_eff += eff;
+        self.total_gen_ms += gen_ms.max(MIN_DUR_MS);
+        // 峰值记录准入：ft 必须真实有效（duration 兜底的行不可信）+ 双下限
+        let real_ft = matches!(ft, Some(f) if completed_ms > f);
+        if real_ft && gen_ms >= HIST_MAX_MIN_GEN_MS && eff >= HIST_MAX_MIN_EFF {
+            let tps = eff as f64 * 1000.0 / gen_ms as f64;
+            if tps > self.max_tps {
+                self.max_tps = tps;
+            }
+        }
+    }
+
+    pub fn avg_tps(&self) -> f64 {
+        if self.total_gen_ms > 0 {
+            self.total_eff as f64 / (self.total_gen_ms as f64 / 1000.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// poll 口径的纯生成时长：ft 有效取 completed-ft，否则 duration_ms（>0 才用），
+/// 最后 max(50) 兜底。基线扫描与增量摄取共用，保证两路口径一致
+fn gen_ms_from(ft: Option<i64>, completed: i64, dur: Option<i64>) -> i64 {
+    match ft {
+        Some(f) if completed > f => completed - f,
+        _ => dur.filter(|d| *d > 0).unwrap_or(MIN_DUR_MS),
+    }
+    .max(MIN_DUR_MS)
+}
+
 
 impl Aggregator {
     pub fn new() -> Self {
@@ -349,6 +411,8 @@ impl Aggregator {
             is_starting: false,
             window_tps,
             last_call_tps,
+            hist_max_tps: 0.0,
+            hist_avg_tps: 0.0,
             live_source: if is_estimating {
                 "window".to_string()
             } else {
@@ -386,6 +450,10 @@ pub struct Engine {
     conn: Option<rusqlite::Connection>,
     agg: Aggregator,
     ingested: HashSet<String>,
+    /// 历史统计（全时段）：首次 poll 时对今日之前的全部行做一次基线扫描，
+    /// 之后随每拍新增调用增量累计
+    hist: HistoryStats,
+    hist_loaded: bool,
     pub db_path: Option<PathBuf>,
 }
 
@@ -415,6 +483,8 @@ impl Engine {
             conn,
             agg: Aggregator::new(),
             ingested: HashSet::new(),
+            hist: HistoryStats::default(),
+            hist_loaded: false,
             db_path,
         }
     }
@@ -437,6 +507,13 @@ impl Engine {
         let Some(conn) = &self.conn else {
             return Vec::new();
         };
+        // 历史统计基线：首次 poll 扫描今日之前的全部已完成行（本地 SQLite 全表
+        // 一次读，实测 ~2 万行毫秒级；今日行由下方增量路径累计，不重复计入）。
+        // conn 与 hist 分字段借用，避免整个 self 的可变/不可变借用冲突
+        if !self.hist_loaded {
+            self.hist_loaded = true;
+            Self::scan_history_before(conn, &mut self.hist, today_start_ms);
+        }
         let mut new_calls = Vec::new();
         let sql = concat!(
             "SELECT id, started_at, first_token_at, completed_at, duration_ms, ",
@@ -493,10 +570,10 @@ impl Engine {
                 continue;
             }
             self.ingested.insert(id.clone());
-            let gen_ms = match ft {
-                Some(f) if completed > f => completed - f,
-                _ => dur.filter(|d| *d > 0).unwrap_or(MIN_DUR_MS),
-            };
+            let gen_ms = gen_ms_from(ft, completed, dur);
+            // 历史统计增量累计（全时段不过滤；峰值走 HistoryStats::fold 的准入口径）
+            let eff = out + reason;
+            self.hist.fold(ft, completed, gen_ms, eff);
             self.agg.ingest(Call {
                 id,
                 started_ms: started,
@@ -520,7 +597,44 @@ impl Engine {
     pub fn snapshot(&self) -> Snapshot {
         let mut s = self.agg.snapshot();
         s.rollout_dir = self.data_source_label();
+        s.hist_max_tps = self.hist.max_tps;
+        s.hist_avg_tps = self.hist.avg_tps();
         s
+    }
+
+    /// 历史统计基线扫描：累计 completed_at 早于今日零点的全部已完成行。
+    /// 失败只打日志不 panic（历史角标显示 0，今日增量路径照常）
+    fn scan_history_before(
+        conn: &rusqlite::Connection,
+        hist: &mut HistoryStats,
+        today_start_ms: i64,
+    ) {
+        let sql = concat!(
+            "SELECT first_token_at, completed_at, duration_ms, ",
+            "output_tokens, reasoning_tokens FROM model_usage ",
+            "WHERE status='completed' AND completed_at < ?1"
+        );
+        let mut query = || -> rusqlite::Result<()> {
+            let mut stmt = conn.prepare_cached(sql)?;
+            let rows = stmt.query_map([today_start_ms], |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for row in rows.flatten() {
+                let (ft, completed, dur, out, reason) = row;
+                let gen = gen_ms_from(ft, completed, dur);
+                hist.fold(ft, completed, gen, out + reason);
+            }
+            Ok(())
+        };
+        if let Err(e) = query() {
+            eprintln!("[zcode-speed-panel] 历史基线扫描失败: {e}");
+        }
     }
 
     /// 今日已摄取的全部调用（供实时模块确定当前会话）
@@ -824,6 +938,123 @@ fn aggregate_model_stats(
     ModelStatsPayload { window_min, bucket_ms, now_ms, series }
 }
 
+// ============ 输出速度曲线（时间范围可选，chart 卡用，零本地存储） ============
+
+/// 曲线合法时间范围（分钟）：15 分钟 / 1 小时 / 6 小时 / 24 小时
+const CHART_WINDOW_CHOICES: [i64; 4] = [15, 60, 360, 1440];
+/// 曲线统一 90 桶（与今日 spark 同密度）：15m→10s、1h→40s、6h→4min、24h→16min
+const CHART_BUCKETS: usize = 90;
+
+/// chart_stats 命令的返回载荷：单序列（全部模型合并）按时间桶的 tps
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartStatsPayload {
+    pub window_min: i64,
+    pub bucket_ms: i64,
+    pub now_ms: i64,
+    /// 恒 90 个，旧→新排列（0 = 最旧桶，末位 = 最新桶）
+    pub buckets: Vec<f64>,
+}
+
+/// 非法窗口值归入最近的合法档位（15 / 60 / 360 / 1440 分钟）
+fn clamp_chart_window(window_min: i64) -> i64 {
+    CHART_WINDOW_CHOICES
+        .iter()
+        .copied()
+        .min_by_key(|&w| (w - window_min).abs())
+        .unwrap_or(15)
+}
+
+/// 纯函数：把窗口内已完成的调用行聚合成 90 桶 tps（口径与今日 spark 一致：
+/// gen = poll 口径兜底链，桶 tps = Σeff ÷ Σgen_s）。便于单测
+fn aggregate_chart_stats(
+    rows: Vec<ModelUsageRow>,
+    window_min: i64,
+    now_ms: i64,
+) -> ChartStatsPayload {
+    let window_min = clamp_chart_window(window_min);
+    let bucket_ms = window_min * 60_000 / CHART_BUCKETS as i64;
+    let mut acc = vec![(0u64, 0i64); CHART_BUCKETS]; // (Σeff, Σgen_ms)
+    for r in rows {
+        let gen = gen_ms_from(r.first_token_at, r.completed_at, r.duration_ms);
+        let slot = now_ms.div_euclid(bucket_ms) - r.completed_at.div_euclid(bucket_ms);
+        if slot < 0 || slot as usize >= CHART_BUCKETS {
+            continue;
+        }
+        let b = &mut acc[CHART_BUCKETS - 1 - slot as usize];
+        b.0 += r.output_tokens + r.reasoning_tokens;
+        b.1 += gen;
+    }
+    ChartStatsPayload {
+        window_min,
+        bucket_ms,
+        now_ms,
+        buckets: acc
+            .into_iter()
+            .map(|(eff, gen)| {
+                if gen > 0 {
+                    eff as f64 / (gen as f64 / 1000.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+    }
+}
+
+impl Engine {
+    /// 输出速度曲线：只读查询窗口内已完成的 model_usage 行，聚合成 90 桶 tps
+    /// （全部模型合并单序列，旧→新）。conn 缺失或查询失败返回全 0 payload
+    pub fn chart_stats(&self, window_min: i64) -> ChartStatsPayload {
+        let window_min = clamp_chart_window(window_min);
+        let now = now_ms();
+        let empty = ChartStatsPayload {
+            window_min,
+            bucket_ms: window_min * 60_000 / CHART_BUCKETS as i64,
+            now_ms: now,
+            buckets: vec![0.0; CHART_BUCKETS],
+        };
+        let Some(conn) = &self.conn else {
+            return empty;
+        };
+        // 与 model_stats 同一条查询（多取一列 model_id，聚合时忽略——保持
+        // SQL 与行结构一致，便于复用 prepare_cached 的口径）
+        let sql = concat!(
+            "SELECT model_id, first_token_at, completed_at, duration_ms, ",
+            "output_tokens, reasoning_tokens FROM model_usage ",
+            "WHERE status='completed' AND completed_at >= ?1 ORDER BY completed_at ASC"
+        );
+        let cutoff = now - window_min * 60_000;
+        let query = || -> rusqlite::Result<Vec<ModelUsageRow>> {
+            let mut stmt = conn.prepare_cached(sql)?;
+            let rows = stmt.query_map([cutoff], |r| {
+                let model: String = r.get(0)?;
+                let ft: Option<i64> = r.get(1)?;
+                let completed: i64 = r.get(2)?;
+                let dur: Option<i64> = r.get(3)?;
+                let out: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                let reason: i64 = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                Ok(ModelUsageRow {
+                    model,
+                    first_token_at: ft,
+                    completed_at: completed,
+                    duration_ms: dur,
+                    output_tokens: out.max(0) as u64,
+                    reasoning_tokens: reason.max(0) as u64,
+                })
+            })?;
+            Ok(rows.flatten().collect())
+        };
+        match query() {
+            Ok(rows) => aggregate_chart_stats(rows, window_min, now),
+            Err(e) => {
+                eprintln!("[zcode-speed-panel] chart_stats query failed: {e}");
+                empty
+            }
+        }
+    }
+}
+
 // ============ 测试 ============
 #[cfg(test)]
 mod tests {
@@ -1059,5 +1290,73 @@ mod tests {
         // 空输入 → 空 series
         let p = aggregate_model_stats(Vec::new(), 10, now);
         assert!(p.series.is_empty());
+    }
+
+    /// 历史统计：平均不过滤（含 duration 兜底行）；峰值记录准入——
+    /// 有效 first_token + gen≥1s + eff≥300，三者缺一不入
+    #[test]
+    fn history_stats_fold_and_admission() {
+        let now = 1_700_000_000_000i64;
+        let mut h = HistoryStats::default();
+        // 正常大调用：1000 tok / 4s = 250 t/s，入峰值
+        h.fold(Some(now - 5_000), now - 1_000, 4_000, 1_000);
+        // 更快的小调用：300 tok / 1.05s ≈ 285.7 t/s，eff=300 达标 → 应刷新峰值
+        h.fold(Some(now - 3_000), now - 1_950, 1_050, 300);
+        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        // 假记录陷阱：79 tok / 24ms（真实库实测形态，1580 t/s）——eff 与时长双不足
+        h.fold(Some(now - 100), now - 76, 24, 79);
+        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        // eff 达标但时长不足（500 tok / 200ms = 2500 t/s）→ 不入
+        h.fold(Some(now - 300), now - 100, 200, 500);
+        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        // duration 兜底行（ft 缺失）计入平均但不入峰值
+        h.fold(None, now - 60_000, 10_000, 2_000);
+        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        // 平均 = Σeff 3800 ÷ Σgen（24ms 行按 MIN_DUR_MS=50 进位）
+        let total_eff = 1_000 + 300 + 79 + 500 + 2_000;
+        let total_gen = 4_000 + 1_050 + 50 + 200 + 10_000;
+        assert!((h.avg_tps() - total_eff as f64 / (total_gen as f64 / 1000.0)).abs() < 1e-9);
+        assert_eq!(h.total_eff, total_eff);
+        assert_eq!(h.total_gen_ms, total_gen);
+        // 空库
+        assert_eq!(HistoryStats::default().avg_tps(), 0.0);
+        assert_eq!(HistoryStats::default().max_tps, 0.0);
+    }
+
+    /// 曲线聚合：90 桶、旧→新排列、越界丢弃、gen 兜底口径与今日 spark 一致。
+    /// now 取槽内中段（非边界对齐），保证"几秒前完成"稳定落最新桶
+    #[test]
+    fn chart_stats_buckets_and_order() {
+        let now = 1_700_000_005_000i64; // 10s 槽内第 5s
+        let rows = vec![
+            // 15 分钟档桶宽 10s：3s 前完成 → 与 now 同槽 → 最新桶（末位）。
+            // gen = ft 差 12s，eff 1000 → 83.3 t/s
+            mrow("m", now - 3_000, Some(now - 15_000), Some(15_000), 1_000, 0),
+            // 95s 前完成 → 距最新槽 9 桶 → 索引 89-9=80；gen 4s eff 3000 → 750 t/s
+            mrow("m", now - 95_000, Some(now - 99_000), Some(9_000), 3_000, 0),
+            // 窗口外（20 分钟前）→ 丢弃
+            mrow("m", now - 1_200_000, Some(now - 1_204_000), None, 9_999, 0),
+        ];
+        let p = aggregate_chart_stats(rows, 15, now);
+        assert_eq!(p.window_min, 15);
+        assert_eq!(p.bucket_ms, 10_000);
+        assert_eq!(p.buckets.len(), 90);
+        assert!((p.buckets[89] - 1_000.0 * 1000.0 / 12_000.0).abs() < 1e-9); // 最新桶
+        assert!((p.buckets[80] - 750.0).abs() < 1e-9);
+        assert!((p.buckets[0] - 0.0).abs() < 1e-9); // 空桶
+    }
+
+    /// 曲线窗口 clamp：999→1440、30→15、90→60、720→360；1h 档桶宽 40s
+    #[test]
+    fn chart_stats_window_clamp() {
+        assert_eq!(clamp_chart_window(999), 1440);
+        assert_eq!(clamp_chart_window(30), 15);
+        assert_eq!(clamp_chart_window(90), 60);
+        assert_eq!(clamp_chart_window(720), 360);
+        assert_eq!(clamp_chart_window(15), 15);
+        let p = aggregate_chart_stats(Vec::new(), 60, 1_700_000_000_000i64);
+        assert_eq!(p.bucket_ms, 60 * 60_000 / 90);
+        assert_eq!(p.buckets.len(), 90);
+        assert!(p.buckets.iter().all(|v| *v == 0.0));
     }
 }

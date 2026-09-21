@@ -431,12 +431,16 @@ export class MiniGauge extends BaseGauge {
   }
 }
 
-/** 卡片角标小圆环：显示最近一轮已完成调用的速度（落盘口径，非实时）。
- *  画在"当前输出速度"卡右上角，尺寸约 56 CSS px，与主表共用分档配色。
+/** 卡片角标小圆环：显示"上轮 / 最高 / 历史"等单值口径（落盘统计，非实时）。
+ *  默认画在"当前输出速度"卡右上角显示上轮调用速度，尺寸约 56 CSS px，
+ *  与主表共用分档配色；label 可换角标文案（峰/历史等）。
  *  今日无已完成调用时保持灰色 0（不做脉冲/估算态：落盘值没有"统计中"一说） */
 export class BadgeGauge extends BaseGauge {
-  constructor(canvas: HTMLCanvasElement, opts?: { tiers?: readonly SpeedTier[] }) {
+  private label: string;
+
+  constructor(canvas: HTMLCanvasElement, opts?: { tiers?: readonly SpeedTier[]; label?: string }) {
     super(canvas, { color: "#22d3ee", minScale: 60, tiers: opts?.tiers });
+    this.label = opts?.label ?? "上轮";
   }
 
   protected draw() {
@@ -481,20 +485,31 @@ export class BadgeGauge extends BaseGauge {
     ctx.fillText(main, cx, cy + 1);
     ctx.fillStyle = "#8b93a7";
     ctx.font = `8px ${FONT}`;
-    ctx.fillText("上轮", cx, cy + r * 0.62);
+    ctx.fillText(this.label, cx, cy + r * 0.62);
   }
 }
 
-/** 近 15 分钟速度曲线（10 秒一档）；x 轴为真实墙钟时刻，整条曲线随时间连续左移 */
+/** 输出速度曲线（默认 15 分钟 10 秒一档）；x 轴为真实墙钟时刻，整条曲线随时间
+ *  连续左移。时间范围可变（15m/1h/6h/24h），经 opts 传入对应桶宽与网格间隔 */
 const SPARK_BUCKET_MS = 10_000;
 const SPARK_GRID_MS = 5 * 60_000;
+
+export interface SparkOptions {
+  /** 桶宽（ms），默认 10s（15 分钟档） */
+  bucketMs?: number;
+  /** x 轴网格间隔（ms），默认 5 分钟（15 分钟档） */
+  gridMs?: number;
+}
 
 export function drawSpark(
   canvas: HTMLCanvasElement,
   values: number[],
   color: string,
   nowMs: number,
+  opts?: SparkOptions,
 ) {
+  const bucketMs = opts?.bucketMs ?? SPARK_BUCKET_MS;
+  const gridMs = opts?.gridMs ?? SPARK_GRID_MS;
   const fit = fitCanvas(canvas);
   if (!fit) return;
   const { ctx, w, h } = fit;
@@ -523,19 +538,20 @@ export function drawSpark(
   }
 
   if (n < 2) return;
-  const phase = (((nowMs % SPARK_BUCKET_MS) + SPARK_BUCKET_MS) % SPARK_BUCKET_MS) / SPARK_BUCKET_MS;
+  const phase = (((nowMs % bucketMs) + bucketMs) % bucketMs) / bucketMs;
   const dx = iw / n;
   const x = (i: number) => padL + iw - ((n - 1 - i) + phase) * dx;
   const y = (v: number) => padT + ih - (Math.min(v, peak) / peak) * ih;
 
-  // ---- x 轴真实时刻刻度（5 分钟整分）：与数据点同一时间映射反解 x，可直接对表验证。
-  // 最新桶结束时刻 = 下一个 10s 边界；右缘即"现在"（差 ≤1 档，肉眼不可辨）
-  const tLastEnd = Math.floor(nowMs / SPARK_BUCKET_MS) * SPARK_BUCKET_MS + SPARK_BUCKET_MS;
-  const xAt = (t: number) => padL + iw - ((tLastEnd - t) / SPARK_BUCKET_MS) * dx;
+  // ---- x 轴真实时刻刻度（按 gridMs 取整分）：与数据点同一时间映射反解 x，
+  //      可直接对表验证。最新桶结束时刻 = 下一个桶边界；右缘即"现在"
+  //      （差 ≤1 档，肉眼不可辨）
+  const tLastEnd = Math.floor(nowMs / bucketMs) * bucketMs + bucketMs;
+  const xAt = (t: number) => padL + iw - ((tLastEnd - t) / bucketMs) * dx;
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
-  let t = Math.ceil((tLastEnd - n * SPARK_BUCKET_MS) / SPARK_GRID_MS) * SPARK_GRID_MS;
-  for (; t <= tLastEnd; t += SPARK_GRID_MS) {
+  let t = Math.ceil((tLastEnd - n * bucketMs) / gridMs) * gridMs;
+  for (; t <= tLastEnd; t += gridMs) {
     const gx = xAt(t);
     if (gx < padL || gx > padL + iw) continue;
     ctx.strokeStyle = "rgba(255,255,255,0.05)";
