@@ -845,6 +845,7 @@ function renderSettingsRows() {
 
 $("btn-settings").addEventListener("click", () => {
   renderSettingsRows();
+  void refreshAutostart();
   setSettingsOpen(true);
 });
 $("settings-close").addEventListener("click", () => setSettingsOpen(false));
@@ -864,6 +865,83 @@ settingsModal.addEventListener("mousedown", (e) => {
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && settingsModal.style.display === "flex") setSettingsOpen(false);
 });
+
+// ---- 自动启动（设置弹窗「自动启动」区）：三态 off / boot / follow ----
+// 与模块显隐不同，事实源在后端（Windows 注册表 / mac LaunchAgent，见
+// autostart.rs）：打开弹窗时回读真实状态、点击即写并按写后回读刷新选中态。
+// 不存 localStorage——注册表/plist 是唯一事实源，避免两处状态漂移。
+// 浏览器预览（无 Tauri）仅展示不可写
+type AutostartMode = "off" | "boot" | "follow";
+const AUTOSTART_DEFS: { id: AutostartMode; name: string; desc: string }[] = [
+  { id: "off", name: "关闭", desc: "不自动启动，需要时手动打开" },
+  { id: "boot", name: "开机自动启动", desc: "登录后常驻启动，按上次退出时的形态（完整面板 / 悬浮窗）显示" },
+  { id: "follow", name: "跟随 ZCode 启动", desc: "登录后静默待命（仅托盘图标、不显示窗口），检测到 ZCode 正在运行时自动亮出面板" },
+];
+const autostartList = $("settings-autostart");
+/** null = 读取中/预览模式（三行都不显示选中） */
+let autostartCurrent: AutostartMode | null = null;
+const autostartError = document.createElement("div");
+autostartError.className = "autostart-error";
+
+function renderAutostartRows() {
+  autostartList.textContent = "";
+  for (const def of AUTOSTART_DEFS) {
+    const on = autostartCurrent === def.id;
+    const row = document.createElement("div");
+    row.className = on ? "settings-row" : "settings-row off";
+
+    // 单选语义：选中行复用模块行的自绘勾选样式（.pet-chk），未选中呈 off 态
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = `ghost-btn settings-toggle${on ? " on" : ""}`;
+    toggle.title = on ? "当前模式" : "切换到该模式";
+    const chk = document.createElement("span");
+    chk.className = "pet-chk";
+    chk.setAttribute("aria-hidden", "true");
+    toggle.append(chk, document.createTextNode(on ? "已选" : "选择"));
+    toggle.addEventListener("click", () => void applyAutostart(def.id));
+
+    const info = document.createElement("div");
+    info.className = "settings-info";
+    const name = document.createElement("span");
+    name.className = "settings-name";
+    name.textContent = def.name;
+    const desc = document.createElement("span");
+    desc.className = "settings-desc";
+    desc.textContent = def.desc;
+    info.append(name, desc);
+
+    row.append(toggle, info);
+    autostartList.append(row);
+  }
+  autostartList.append(autostartError);
+}
+
+/** 打开弹窗时从后端回读真实状态（注册表/plist 即事实源，不信任上次内存值） */
+const refreshAutostart = async () => {
+  const mode = await tauriInvoke<string>("autostart_get");
+  autostartCurrent = mode === "boot" || mode === "follow" ? mode : "off";
+  autostartError.textContent = "";
+  renderAutostartRows();
+};
+
+const applyAutostart = async (mode: AutostartMode) => {
+  if (!hasTauri || mode === autostartCurrent) return;
+  const prev = autostartCurrent;
+  autostartCurrent = mode;
+  autostartError.textContent = "";
+  renderAutostartRows();
+  try {
+    // 后端写完回读生效值（写失败抛错，前端回滚选中态并展示原因）
+    const applied = await tauriInvoke<string>("autostart_set", { mode });
+    autostartCurrent = applied === "boot" || applied === "follow" ? applied : "off";
+  } catch (e) {
+    autostartCurrent = prev;
+    autostartError.textContent = `设置失败：${e}`;
+  }
+  renderAutostartRows();
+};
+renderAutostartRows();
 
 // ---- 重新校准（当前速度卡左上角 ⟳）：丢弃字节→token 系数样本回到先验 ----
 const btnRecal = $<HTMLButtonElement>("btn-recal");

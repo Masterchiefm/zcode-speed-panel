@@ -1698,6 +1698,9 @@ body.float-mode #update-toast {
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(13, 20, 36, 0.97);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  /* 加入自动启动区后弹窗变高：限制在视口内、超高自身滚动 */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
 }
 
 #settings-hint {
@@ -1782,6 +1785,36 @@ body.float-mode #update-toast {
   display: grid;
   place-items: center;
   font-size: 12px;
+}
+
+/* ---- 自动启动（设置弹窗第二区）：三态单选，行样式复用 .settings-row ---- */
+.settings-section-title {
+  margin: 14px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+#settings-autostart {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#settings-autostart-note {
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+/* 写注册表/LaunchAgent 失败时的行内报错（空时不占位） */
+.autostart-error {
+  font-size: 11px;
+  color: #f87171;
+}
+.autostart-error:empty {
+  display: none;
 }
 
 /* 悬浮窗/桌宠窗口太小放不下设置 UI：不显示（回到完整面板仍可打开） */

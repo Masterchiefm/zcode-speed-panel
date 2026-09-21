@@ -319,18 +319,23 @@
         </div>
       </div>
 
-      <!-- 设置弹窗：模块显隐与排序（顶栏 ⚙ 打开；复用模型详情弹窗的遮罩+卡片风格）。
+      <!-- 设置弹窗：模块显隐与排序 + 自动启动（顶栏 ⚙ 打开；复用模型详情弹窗的遮罩+卡片风格）。
            行由 main.ts 按 MODULE_DEFS 动态渲染：自绘勾选框（.pet-chk 同款）+ ↑↓ 排序，
-           变更即时生效并存 localStorage（modules.v1） -->
+           变更即时生效并存 localStorage（modules.v1）；自动启动三态行也由 main.ts 渲染，
+           读写后端命令（Windows 注册表 / mac LaunchAgent 即事实源，不存 localStorage） -->
       <div id="settings-modal">
         <div id="settings-modal-box">
           <div class="model-modal-head">
-            <span class="model-modal-title">设置 · 显示模块</span>
-            <button id="settings-reset" class="ghost-btn" type="button" title="恢复默认：仪表盘 / 网速监控 / 近 15 分钟输出速度显示，快照防护与上传记录隐藏，顺序还原">恢复默认</button>
+            <span class="model-modal-title">设置</span>
+            <button id="settings-reset" class="ghost-btn" type="button" title="恢复默认：仪表盘 / 网速监控 / 近 15 分钟输出速度显示，快照防护与上传记录隐藏，顺序还原（自动启动不受影响）">恢复默认</button>
             <button id="settings-close" class="ghost-btn" type="button" title="关闭">✕</button>
           </div>
+          <div class="settings-section-title">显示模块</div>
           <div id="settings-hint" class="dim">勾选要显示的模块；↑↓ 调整顺序（列表从上到下 = 面板从上到下）。即时生效并记住。</div>
           <div id="settings-modules"></div>
+          <div class="settings-section-title">自动启动</div>
+          <div id="settings-autostart"></div>
+          <div id="settings-autostart-note" class="dim">开机自启 = 登录后按上次形态常驻启动；跟随 ZCode = 登录后静默待命（仅托盘），检测到 ZCode 正在运行时自动亮出面板。面板手动退出后不再自动复活，重新登录或手动打开恢复。</div>
         </div>
       </div>
 
