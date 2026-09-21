@@ -1,6 +1,7 @@
 // 浏览器预览模式：模拟 ZCode 的 model-io 调用流，便于无 Tauri 环境下预览 UI
 
 import type { GuardStatus } from "./guard";
+import type { ModelStatsPayload } from "./model_stats";
 
 /** 分任务实时明细（多任务并发时才有多个）：一个 CLI 进程 = 一行 */
 export interface TaskStat {
@@ -100,6 +101,8 @@ interface MockCall {
   silent: boolean;
   /** 并发任务期间第二个进程的固定速度（0 = 单任务；按调用固定，不逐拍重抽） */
   second: number;
+  /** 模型名（模型详情视图按此分组；与真实库的 model_id 同角色） */
+  model: string;
 }
 
 const MIN_DUR = 50;
@@ -108,6 +111,9 @@ const BUCKETS = 90;
 const BUCKET = 10_000;
 
 const rnd = (a: number, b: number) => a + Math.random() * (b - a);
+
+/** 模拟模型池：主模型高频，两个次模型低频（模型详情视图的多条折线演示） */
+const MODEL_POOL = ["claude-sonnet-4-5", "claude-sonnet-4-5", "glm-4.6", "deepseek-v3.2"];
 
 let calls: MockCall[] = [];
 let sessionNo = 1;
@@ -133,6 +139,7 @@ function newCall(now: number): MockCall {
     session: `mock-sess-${sessionNo}`,
     silent: Math.random() < 0.22,
     second: Math.random() < 0.3 ? rnd(15, 90) : 0,
+    model: MODEL_POOL[Math.floor(Math.random() * MODEL_POOL.length)],
   };
 }
 
@@ -304,6 +311,54 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
         ]
       : [{ remote: "61.151.230.245:443", pid: 18104, proc: "主进程" }],
   };
+}
+
+/** 模型详情视图的模拟数据：把调用流按模型 × 绝对墙钟槽聚合（与后端
+ *  aggregate_model_stats 同口径：slot = now÷bucketMs − completed÷bucketMs，
+ *  90 桶、四档窗口与曲线共用、越界丢弃、桶 tps = Σeff ÷ Σgen_s），供无 Tauri 预览 */
+export function mockModelStats(windowMin: number): ModelStatsPayload {
+  const win = [15, 60, 360, 1440].reduce((a, b) => (Math.abs(b - windowMin) < Math.abs(a - windowMin) ? b : a));
+  const now = Date.now();
+  const bucketMs = (win * 60_000) / 90;
+  const cutoff = now - win * 60_000;
+  interface Acc {
+    eff: number;
+    gen: number;
+    calls: number;
+  }
+  const per = new Map<string, { slots: Acc[]; total: Acc }>();
+  for (const c of calls) {
+    if (c.completed < cutoff || c.completed > now) continue;
+    const gen = Math.max(MIN_DUR, c.duration);
+    const slot = Math.floor(now / bucketMs) - Math.floor(c.completed / bucketMs);
+    if (slot < 0 || slot >= 90) continue;
+    let e = per.get(c.model);
+    if (!e) {
+      e = { slots: Array.from({ length: 90 }, () => ({ eff: 0, gen: 0, calls: 0 })), total: { eff: 0, gen: 0, calls: 0 } };
+      per.set(c.model, e);
+    }
+    const b = e.slots[slot];
+    b.eff += c.output;
+    b.gen += gen;
+    b.calls += 1;
+    e.total.eff += c.output;
+    e.total.gen += gen;
+    e.total.calls += 1;
+  }
+  const grandEff = [...per.values()].reduce((t, e) => t + e.total.eff, 0);
+  const tpsOf = (b: Acc) => (b.gen > 0 ? b.eff / (b.gen / 1000) : 0);
+  const series = [...per.entries()]
+    .sort((a, b) => b[1].total.eff - a[1].total.eff || a[0].localeCompare(b[0]))
+    .map(([model, e]) => ({
+      model,
+      buckets: e.slots.map((b) => ({ tps: tpsOf(b), calls: b.calls, tokens: b.eff })),
+      totalCalls: e.total.calls,
+      totalTokens: e.total.eff,
+      avgTps: e.total.gen > 0 ? e.total.eff / (e.total.gen / 1000) : 0,
+      peakTps: Math.max(0, ...e.slots.map(tpsOf)),
+      share: grandEff > 0 ? e.total.eff / grandEff : 0,
+    }));
+  return { windowMin: win, bucketMs, nowMs: now, series };
 }
 
 export function startMock(onData: (s: Snapshot) => void) {

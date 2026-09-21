@@ -207,7 +207,7 @@ export function initGuard(invoke: InvokeFn): void {
   });
   $("guard-confirm-cancel").addEventListener("click", closeConfirm);
   $("guard-confirm-close").addEventListener("click", closeConfirm);
-  // 点弹窗内容之外关闭（与 #model-modal 同款交互）
+  // 点弹窗内容之外关闭（与设置弹窗同款交互）
   window.addEventListener("mousedown", (e) => {
     if (modal.style.display !== "flex") return;
     if (box.contains(e.target as Node)) return;

@@ -2,7 +2,7 @@ import "./style.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtBps, fmtBytes, fmtClock, fmtDayClock, fmtTokens, fmtTps, speedColor } from "./gauges";
 import { PetWidget } from "./pet";
-import { startMock, type CkptStat, type ConnStat, type Snapshot } from "./mock";
+import { startMock, mockModelStats, type CkptStat, type ConnStat, type Snapshot } from "./mock";
 import { initModelStats } from "./model_stats";
 import { initGuard, renderGuard, type GuardStatus } from "./guard";
 
@@ -222,6 +222,10 @@ let chartTimer = 0;
 // 最新一拍的实时状态（长档位尾桶混入用）
 let liveTpsNow = 0;
 let liveActive = false;
+// ---- 曲线卡视图（整体输出速度曲线 / 模型详情，拨杆互斥切换，记住选择）----
+type ChartView = "total" | "model";
+const CHART_VIEW_KEY = "chartView.v1";
+let chartView: ChartView = localStorage.getItem(CHART_VIEW_KEY) === "model" ? "model" : "total";
 
 function chartRangeCfg(): (typeof CHART_RANGES)[number] {
   return CHART_RANGES.find((r) => r.value === chartRange) ?? CHART_RANGES[0];
@@ -712,10 +716,19 @@ const chartRangeOptions = Array.from(
   $<HTMLElement>("chart-window-list").querySelectorAll<HTMLButtonElement>("button[data-value]"),
 );
 
+/** 曲线卡标题按当前视图 + 当前范围档生成（范围下拉两视图共用） */
+function updateChartTitle() {
+  const cfg = chartRangeCfg();
+  $("chart-title").textContent =
+    chartView === "model"
+      ? `近 ${cfg.label}模型速度趋势（${cfg.bucketLabel} · 按模型分类 · token/s）`
+      : `近 ${cfg.label}输出速度（${cfg.bucketLabel} · token/s，横轴为真实时刻）`;
+}
+
 function applyChartRangeUi() {
   const cfg = chartRangeCfg();
   $("chart-window-label").textContent = cfg.label;
-  $("chart-title").textContent = `近 ${cfg.label}输出速度（${cfg.bucketLabel} · token/s，横轴为真实时刻）`;
+  updateChartTitle();
   for (const opt of chartRangeOptions) {
     opt.classList.toggle("selected", Number(opt.dataset.value) === chartRange);
   }
@@ -742,6 +755,8 @@ function selectChartRange(r: ChartRange) {
     void refreshChartStats();
     chartTimer = window.setInterval(() => void refreshChartStats(), 5000);
   }
+  // 模型详情视图与整体曲线共用范围档：切档立即重拉模型统计
+  if (chartView === "model") modelStats.refresh();
   redrawSpark();
 }
 
@@ -834,7 +849,7 @@ const MODULE_DEFS: { id: ModuleId; name: string; desc: string }[] = [
   { id: "gauges", name: "仪表盘", desc: "当前速度 / 今日平均 / 今日总量（多任务时含并发任务明细）" },
   { id: "net", name: "网速监控", desc: "整机上传/下载速度 · ZCode 连接归属 · 今日累计" },
   { id: "guard", name: "快照防护与上传记录", desc: "防护开关 · 今日快照上传 · 上传记录列表" },
-  { id: "chart", name: "输出速度曲线", desc: "近 15 分钟 / 1 小时 / 6 小时 / 24 小时速度曲线 · 模型详情入口" },
+  { id: "chart", name: "输出速度曲线", desc: "整体速度曲线（四档时间范围）· 拨杆切换模型速度趋势" },
 ];
 const MODULES_KEY = "modules.v1";
 const MODULES_DEFAULT_ORDER: ModuleId[] = ["gauges", "net", "chart", "guard"];
@@ -1317,8 +1332,41 @@ if (hasTauri) {
 
 applyStyleUi(localStorage.getItem("floatStyle") ?? "gauge");
 
-// ---- 模型速度趋势详情弹窗（图表卡片"模型详情"入口；复用同一个 tauriInvoke） ----
-initModelStats(tauriInvoke);
+// ---- 曲线卡「模型详情」视图（与整体输出速度曲线拨杆互斥切换） ----
+/** 浏览器预览（无 Tauri）：model_stats 走 mock 生成器（与整体曲线 mock 同源
+ *  的调用流按模型拆分），其余命令照常走 tauriInvoke 静默返回 undefined */
+async function modelStatsInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | undefined> {
+  if (!hasTauri && cmd === "model_stats") {
+    return mockModelStats(Number(args?.windowMin ?? 60)) as T;
+  }
+  return tauriInvoke<T>(cmd, args);
+}
+const modelStats = initModelStats(modelStatsInvoke, () => ({
+  windowMin: chartRange,
+  gridMs: chartRangeCfg().gridMs,
+}));
+
+// 分段拨杆：整体曲线 / 模型详情两视图互斥（色块滑到激活一侧）；
+// 显隐由 body.chart-view-model 驱动 CSS（#spark 与 #model-view 成对切换），
+// 数据轮询随视图启停（modelStats.setActive）。时间范围两视图共用，切拨杆不变
+const viewToggle = $<HTMLButtonElement>("chart-view-toggle");
+
+function applyChartViewUi() {
+  const model = chartView === "model";
+  document.body.classList.toggle("chart-view-model", model);
+  viewToggle.classList.toggle("on", model);
+  viewToggle.setAttribute("aria-checked", String(model));
+  updateChartTitle();
+  if (!model) redrawSpark(); // 切回整体曲线时立即重画（隐藏期间画布跳过了所有绘制）
+  modelStats.setActive(model);
+}
+
+viewToggle.addEventListener("click", () => {
+  chartView = chartView === "model" ? "total" : "model";
+  localStorage.setItem(CHART_VIEW_KEY, chartView);
+  applyChartViewUi();
+});
+applyChartViewUi();
 
 // ---- 快照防护卡片（网络监控卡下方；状态随 metrics payload 的 guard 字段推送） ----
 initGuard(tauriInvoke);

@@ -1,22 +1,20 @@
-// 模型速度趋势详情弹窗：按模型分类的速度折线（统一 60 桶）与窗口统计。
-// 数据来自后端 model_stats 命令（只读查询 usage 库 model_usage 表现算聚合，
-// 零本地存储）；弹窗打开期间每 5s 拉取一次，关闭即停。
+// 模型速度趋势视图（曲线卡内，与整体输出速度曲线拨杆互斥切换）：按模型分类的
+// 速度折线（统一 90 桶）与窗口统计。数据来自后端 model_stats 命令（只读查询
+// usage 库 model_usage 表现算聚合，零本地存储）；视图激活期间每 5s 拉取一次、
+// 每 1s 按墙钟相位平移重画，取消激活即停。
+// 时间轴与整体曲线（gauges.drawSpark）完全同规格：同一组时间范围档位（由
+// main.ts 的范围下拉决定，切视图不改变范围）、同一桶宽与网格间隔，桶按绝对
+// 墙钟槽对齐（后端 div_euclid），x 映射锚定"下一桶边界"，网格线取整分时刻，
+// 曲线随时间平移不变形、两视图横轴逐像素对齐。
 // 图例为可点击 chips：切换该模型显隐（折线与底部统计行同步过滤，至少保留
 // 一个——全取消自动回全选），行尾附「全选 / 仅 Top3」；选中集合存
-// localStorage（modelStats.visible.v1），5s 轮询刷新不闪。
-import { fmtClock, fmtTokens, fmtTps } from "./gauges";
+// localStorage（modelStats.visible.v1）。
+import { fmtClock, fmtTokens, fmtTps, niceCeil } from "./gauges";
 
 const FONT = `"Segoe UI", "Microsoft YaHei", sans-serif`;
 
 /** 折线/图例配色（按 series 顺序循环） */
 const PALETTE = ["#22d3ee", "#a78bfa", "#34d399", "#fbbf24", "#f87171", "#60a5fa", "#f472b6", "#4ade80"];
-
-/** 统计窗口选项（分钟），与后端 clamp 档位一致 */
-const WINDOW_OPTIONS = [
-  { value: 10, label: "最近 10 分钟" },
-  { value: 60, label: "最近 1 小时" },
-  { value: 360, label: "最近 6 小时" },
-];
 
 /** 图例与统计行里模型名的截断长度（超过加 …，完整名放 title） */
 const MODEL_NAME_MAX = 18;
@@ -37,13 +35,13 @@ const loadVisible = (): Set<string> => {
   return new Set();
 };
 
-interface ModelBucket {
+export interface ModelBucket {
   tps: number;
   calls: number;
   tokens: number;
 }
 
-interface ModelSeries {
+export interface ModelSeries {
   model: string;
   buckets: ModelBucket[];
   totalCalls: number;
@@ -53,7 +51,7 @@ interface ModelSeries {
   share: number;
 }
 
-interface ModelStatsPayload {
+export interface ModelStatsPayload {
   windowMin: number;
   bucketMs: number;
   nowMs: number;
@@ -97,9 +95,17 @@ interface VisibleItem {
   idx: number;
 }
 
-/** 每模型一条 tps 折线：y 轴 0~峰值×1.15 自适应 + 3 条横网格线，x 轴 5 个真实时刻刻度。
+/** 每模型一条 tps 折线：y 轴 0~niceCeil(峰值×1.25)（与整体曲线同口径量化，
+ *  数据微变不致整条曲线纵向缩放）+ 3 条横网格线；x 轴与 drawSpark 完全同映射——
+ *  右缘 = 下一桶边界，网格线取 gridMs 整分时刻，数据点画在墙钟桶中心。
  *  只画 visible 里的模型，配色取各自在完整列表中的原始序号（隐藏再显示颜色不变） */
-function drawModelChart(canvas: HTMLCanvasElement, p: ModelStatsPayload, visible: VisibleItem[]) {
+function drawModelChart(
+  canvas: HTMLCanvasElement,
+  p: ModelStatsPayload,
+  visible: VisibleItem[],
+  nowMs: number,
+  gridMs: number,
+) {
   const fit = fitCanvas(canvas);
   if (!fit) return;
   const { ctx, w, h } = fit;
@@ -109,13 +115,13 @@ function drawModelChart(canvas: HTMLCanvasElement, p: ModelStatsPayload, visible
   const padB = 20;
   const iw = w - padL - padR;
   const ih = h - padT - padB;
-  const n = visible[0]?.s.buckets.length ?? p.series[0]?.buckets.length ?? 60;
-  const spanMs = n * p.bucketMs;
-  // 桶 i（0 = 最新）的中心时刻：右缘 ≈ 现在
-  const tStart = p.nowMs - spanMs;
-  const xAt = (t: number) => padL + (iw * (t - tStart)) / spanMs;
-  const yMax = Math.max(10, Math.max(0, ...visible.flatMap((it) => it.s.buckets.map((b) => b.tps))) * 1.15);
-  const yAt = (v: number) => padT + ih - (Math.min(v, yMax) / yMax) * ih;
+  const n = visible[0]?.s.buckets.length ?? p.series[0]?.buckets.length ?? 90;
+  const bucketMs = p.bucketMs;
+  const peak = Math.max(
+    10,
+    niceCeil(Math.max(0, ...visible.flatMap((it) => it.s.buckets.map((b) => b.tps))) * 1.25),
+  );
+  const yAt = (v: number) => padT + ih - (Math.min(v, peak) / peak) * ih;
 
   // 3 条横网格线 + 刻度文字（顶 = 峰值档、中 = 半档、底 = 0）
   ctx.strokeStyle = "rgba(255,255,255,0.06)";
@@ -130,23 +136,33 @@ function drawModelChart(canvas: HTMLCanvasElement, p: ModelStatsPayload, visible
     ctx.moveTo(padL, y);
     ctx.lineTo(w - padR, y);
     ctx.stroke();
-    ctx.fillText(fmtTps((yMax * (2 - i)) / 2), padL - 6, y);
+    ctx.fillText(fmtTps((peak * (2 - i)) / 2), padL - 6, y);
   }
+  if (visible.length === 0) return;
 
-  // x 轴 5 个时间刻度（HH:MM），竖向细网格线便于对表
+  // ---- x 轴真实时刻刻度：与 drawSpark 同一映射（可对表验证）。
+  //      最新桶结束时刻 = 下一个墙钟桶边界；右缘即"现在"（差 ≤1 桶），
+  //      nowMs 在桶内滑动时整条曲线连续左移，网格线钉在整分不动
+  const dx = iw / n;
+  const tLastEnd = Math.floor(nowMs / bucketMs) * bucketMs + bucketMs;
+  const xAt = (t: number) => padL + iw - ((tLastEnd - t) / bucketMs) * dx;
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
-  for (let k = 0; k <= 4; k++) {
-    const t = tStart + (spanMs * k) / 4;
+  let t = Math.ceil((tLastEnd - n * bucketMs) / gridMs) * gridMs;
+  for (; t <= tLastEnd; t += gridMs) {
     const gx = xAt(t);
-    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    if (gx < padL || gx > padL + iw) continue;
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
     ctx.beginPath();
     ctx.moveTo(gx, padT);
     ctx.lineTo(gx, padT + ih);
     ctx.stroke();
     ctx.fillText(fmtClock(t).slice(0, 5), gx, h - padB + 4);
   }
-  if (visible.length === 0) return;
+  // 右缘：当前时刻（靠右对齐避免溢出）
+  ctx.textAlign = "right";
+  ctx.fillStyle = "rgba(139,147,167,0.9)";
+  ctx.fillText(`现在 ${fmtClock(nowMs).slice(0, 5)}`, padL + iw, h - padB + 4);
 
   ctx.lineWidth = 2;
   ctx.lineJoin = "round";
@@ -154,7 +170,8 @@ function drawModelChart(canvas: HTMLCanvasElement, p: ModelStatsPayload, visible
     ctx.strokeStyle = PALETTE[idx % PALETTE.length];
     ctx.beginPath();
     s.buckets.forEach((b, i) => {
-      const x = xAt(tStart + (n - i - 0.5) * p.bucketMs);
+      // 桶 i（0 = 最新）中心时刻：最新桶右缘 tLastEnd 往回 (i+0.5) 个桶
+      const x = xAt(tLastEnd - (i + 0.5) * bucketMs);
       const y = yAt(b.tps);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
@@ -163,27 +180,33 @@ function drawModelChart(canvas: HTMLCanvasElement, p: ModelStatsPayload, visible
   }
 }
 
-/** 绑定弹窗全部交互：入口按钮、窗口下拉、5s 轮询、绘制与关闭清理 */
-export function initModelStats(invoke: InvokeFn): void {
-  const modal = $("model-modal");
-  const box = $("model-modal-box");
-  const openBtn = $("btn-model-stats");
-  const closeBtn = $("model-modal-close");
-  const dropdown = $("model-window");
-  const dropdownBtn = $<HTMLButtonElement>("model-window-btn");
-  const dropdownLabel = $("model-window-label");
+/** 模型详情视图控制器：setActive(true) 起数据轮询与平移重绘，false 全停；
+ *  refresh() 在统计范围档位变化时立即重拉（5s 轮询照常继续）。
+ *  画布/图例/统计行的 DOM 由本模块自管；显隐切换（CSS body.chart-view-model）
+ *  与持久化在 main.ts——视图开关与时间范围都属于曲线卡整体 */
+export interface ModelStatsController {
+  setActive(active: boolean): void;
+  refresh(): void;
+}
+
+/** 绑定模型详情视图：5s 数据轮询、1s 相位平移重绘。
+ *  getRange 返回整体曲线当前的统计范围与网格间隔（单一事实源在 main.ts 的
+ *  CHART_RANGES）——两视图共用同一条时间轴，切换拨杆不改变范围 */
+export function initModelStats(
+  invoke: InvokeFn,
+  getRange: () => { windowMin: number; gridMs: number },
+): ModelStatsController {
   const legend = $("model-legend");
   const canvas = $<HTMLCanvasElement>("model-chart");
   const empty = $("model-empty");
   const summary = $("model-summary");
-  const options = Array.from(dropdown.querySelectorAll<HTMLButtonElement>("button[data-value]"));
 
-  let isOpen = false;
-  let timer = 0;
-  let windowMin = 60; // 默认 1 小时
+  let active = false;
+  let fetchTimer = 0;
+  let slideTimer = 0;
   let lastPayload: ModelStatsPayload | null = null;
   // 模型显隐选择：Set 里的模型可见。至少保留一个（全取消自动回全选），
-  // 持久化到 localStorage；5s 轮询只是重画，选中集合在内存里自然保持不闪
+  // 持久化到 localStorage；轮询只是重画，选中集合在内存里自然保持不闪
   let visible = loadVisible();
   /** 本会话已见过的模型：null = 首帧未到；首帧按存档裁剪/回退，之后
    *  新出现的模型（换模型/新窗口）默认可见，不被旧存档静默隐藏 */
@@ -221,13 +244,13 @@ export function initModelStats(invoke: InvokeFn): void {
     else visible.add(model);
     if (visible.size === 0) models.forEach((m) => visible.add(m));
     saveVisible();
-    rerender();
+    render(lastPayload);
   };
 
   const selectAll = (models: string[]) => {
     models.forEach((m) => visible.add(m));
     saveVisible();
-    rerender();
+    render(lastPayload);
   };
 
   /** 仅 Top3：按 total_tokens 排序取前三（模型不足 3 个时等价全选） */
@@ -235,17 +258,21 @@ export function initModelStats(invoke: InvokeFn): void {
     const top3 = [...series].sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 3).map((s) => s.model);
     visible = new Set(top3);
     saveVisible();
-    rerender();
+    render(lastPayload);
   };
 
-  const setDropdownOpen = (open: boolean) => {
-    dropdown.classList.toggle("open", open);
-    dropdownBtn.setAttribute("aria-expanded", String(open));
+  /** 空态：无 payload / 空窗口 / 拉取失败时占位（图例与统计行一并隐藏） */
+  const showEmpty = (text: string) => {
+    empty.textContent = text;
+    empty.style.display = "flex";
+    legend.style.display = "none";
+    summary.style.display = "none";
   };
 
   /** 渲染一次 payload：图例 chips、统计行与折线（无数据时显示空状态）。
    *  图例与统计行只列可见模型；chip 配色用原始序号，隐藏再显示颜色不变 */
-  const render = (p: ModelStatsPayload) => {
+  const render = (p: ModelStatsPayload | null) => {
+    if (!p) return;
     lastPayload = p;
     const models = p.series.map((s) => s.model);
     // 空窗口不动选择（否则会把存档清空，数据回来时选择丢失）
@@ -255,8 +282,10 @@ export function initModelStats(invoke: InvokeFn): void {
       .filter((it) => visible.has(it.s.model));
     const has = p.series.length > 0;
     empty.style.display = has ? "none" : "flex";
+    if (!has) empty.textContent = "窗口内暂无调用数据";
     legend.style.display = has ? "flex" : "none";
     summary.style.display = has ? "flex" : "none";
+    if (!has) return;
     legend.replaceChildren();
     summary.replaceChildren();
     p.series.forEach((s, i) => {
@@ -290,89 +319,69 @@ export function initModelStats(invoke: InvokeFn): void {
       row.append(rdot, text);
       summary.append(row);
     });
-    if (has) {
-      // 行尾操作：全选 / 仅 Top3
-      const tools = document.createElement("span");
-      tools.className = "model-legend-tools";
-      const allBtn = document.createElement("button");
-      allBtn.type = "button";
-      allBtn.textContent = "全选";
-      allBtn.title = "显示全部模型";
-      allBtn.addEventListener("click", () => selectAll(models));
-      const top3Btn = document.createElement("button");
-      top3Btn.type = "button";
-      top3Btn.textContent = "仅 Top3";
-      top3Btn.title = "只显示 token 用量前三的模型";
-      top3Btn.addEventListener("click", () => selectTop3(p.series));
-      tools.append(allBtn, top3Btn);
-      legend.append(tools);
-      drawModelChart(canvas, p, visibleItems);
-    }
+    // 行尾操作：全选 / 仅 Top3
+    const tools = document.createElement("span");
+    tools.className = "model-legend-tools";
+    const allBtn = document.createElement("button");
+    allBtn.type = "button";
+    allBtn.textContent = "全选";
+    allBtn.title = "显示全部模型";
+    allBtn.addEventListener("click", () => selectAll(models));
+    const top3Btn = document.createElement("button");
+    top3Btn.type = "button";
+    top3Btn.textContent = "仅 Top3";
+    top3Btn.title = "只显示 token 用量前三的模型";
+    top3Btn.addEventListener("click", () => selectTop3(p.series));
+    tools.append(allBtn, top3Btn);
+    legend.append(tools);
+    drawModelChart(canvas, p, visibleItems, Date.now(), getRange().gridMs);
   };
 
-  /** 交互后按最近一次 payload 重画（不重新拉取，选中切换即时生效） */
-  const rerender = () => {
-    if (lastPayload) render(lastPayload);
-  };
-
-  const fetchNow = () => {
-    // 收起为悬浮窗时弹窗已被 CSS 隐藏（窗口太小放不下）：停表关闭，不再空转拉取
-    if (document.body.classList.contains("float-mode")) {
-      close();
-      return;
-    }
-    invoke<ModelStatsPayload>("model_stats", { windowMin })
-      .then((p) => {
-        if (p && isOpen) render(p);
-      })
-      .catch((err) => console.warn("[model_stats] invoke failed:", err));
-  };
-
-  const open = () => {
-    if (isOpen) return;
-    isOpen = true;
-    modal.style.display = "flex";
-    fetchNow();
-    timer = window.setInterval(fetchNow, 5000);
-  };
-
-  const close = () => {
-    if (!isOpen) return;
-    isOpen = false;
-    window.clearInterval(timer);
-    modal.style.display = "none";
-    setDropdownOpen(false);
-  };
-
-  openBtn.addEventListener("click", () => (isOpen ? close() : open()));
-  closeBtn.addEventListener("click", close);
-  // 点弹窗内容之外关闭（入口按钮自身除外，由上面的 click 切换开关；
-  // 与 main.ts 的 float-menu / 样式下拉 mousedown 监听各自独立，互不影响）
-  window.addEventListener("mousedown", (e) => {
-    if (!isOpen) return;
-    const t = e.target as Node;
-    if (box.contains(t) || openBtn.contains(t)) return;
-    close();
-  });
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && isOpen) close();
-  });
-  window.addEventListener("resize", () => {
-    if (!isOpen || !lastPayload) return;
+  /** 1s 相位平移重绘：只画布不重建 DOM——数据 5s 才变，期间曲线随墙钟连续左移 */
+  const slide = () => {
+    if (!active || !lastPayload || document.body.classList.contains("float-mode")) return;
     const items: VisibleItem[] = lastPayload.series
       .map((s, idx) => ({ s, idx }))
       .filter((it) => visible.has(it.s.model));
-    if (items.length) drawModelChart(canvas, lastPayload, items);
-  });
+    if (items.length) drawModelChart(canvas, lastPayload, items, Date.now(), getRange().gridMs);
+  };
 
-  dropdownBtn.addEventListener("click", () => setDropdownOpen(!dropdown.classList.contains("open")));
-  for (const opt of options) {
-    opt.addEventListener("click", () => {
-      setDropdownOpen(false);
-      windowMin = Number(opt.dataset.value) || 60;
-      dropdownLabel.textContent = WINDOW_OPTIONS.find((w) => w.value === windowMin)?.label ?? `最近 ${windowMin} 分钟`;
-      for (const o of options) o.classList.toggle("selected", o === opt);
-      if (isOpen) fetchNow(); // 切窗口立即拉一次（定时器继续按新窗口拉取）
-    });
-  }
+  const fetchNow = () => {
+    if (!active) return;
+    // 收起为悬浮窗时 main 整体被 CSS 隐藏：跳过拉取（回到完整面板自动恢复）
+    if (document.body.classList.contains("float-mode")) return;
+    invoke<ModelStatsPayload>("model_stats", { windowMin: getRange().windowMin })
+      .then((p) => {
+        if (!active) return;
+        if (p) render(p);
+        else if (!lastPayload) showEmpty("统计暂不可用");
+      })
+      .catch((err) => {
+        console.warn("[model_stats] invoke failed:", err);
+        if (active && !lastPayload) showEmpty("统计读取失败");
+      });
+  };
+
+  const setActive = (on: boolean) => {
+    if (active === on) return;
+    active = on;
+    window.clearInterval(fetchTimer);
+    fetchTimer = 0;
+    window.clearInterval(slideTimer);
+    slideTimer = 0;
+    if (on) {
+      if (!lastPayload) showEmpty("读取统计中…");
+      fetchNow();
+      fetchTimer = window.setInterval(fetchNow, 5000);
+      slideTimer = window.setInterval(slide, 1000);
+    }
+  };
+
+  window.addEventListener("resize", slide);
+  return {
+    setActive,
+    refresh: () => {
+      if (active) fetchNow(); // 换档立即重拉（5s 定时器继续按新档拉取）
+    },
+  };
 }

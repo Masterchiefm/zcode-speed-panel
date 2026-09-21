@@ -83,14 +83,14 @@
               class="corner-gauge"
               title="上一轮调用速度：最近一次已完成调用（输出+思考 ÷ 纯生成时长，落盘口径）"
             ></canvas>
-            <canvas
-              id="g-peak"
-              class="corner-gauge corner-bottom"
-              title="历史最高速度：有效输出 ≥300 token 且纯生成 ≥1s 的调用中最快一次（毫秒级小调用时间戳噪声大，不计入记录）"
-            ></canvas>
-            <div class="sub sub-badge" id="sub-current">等待数据…</div>
+            <div class="sub" id="sub-current">等待数据…</div>
           </div>
           <div class="card gauge-card">
+            <canvas
+              id="g-peak"
+              class="corner-gauge corner-left"
+              title="历史最高速度：有效输出 ≥300 token 且纯生成 ≥1s 的调用中最快一次（毫秒级小调用时间戳噪声大，不计入记录）"
+            ></canvas>
             <canvas id="g-avg"></canvas>
             <canvas
               id="g-histavg"
@@ -214,7 +214,10 @@
           <div class="chart-head">
             <span id="chart-title">近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
             <span class="chart-head-right">
-              <div id="chart-window" class="dropdown" title="曲线时间范围（默认 15 分钟，记住选择）">
+              <!-- 峰值标签在时间范围下拉左侧；下拉两视图共用：切换拨杆只换序列，
+                   不改变统计范围 -->
+              <span id="chart-max" class="dim">峰值 0</span>
+              <div id="chart-window" class="dropdown" title="曲线时间范围（整体曲线与模型详情共用，默认 15 分钟，记住选择）">
                 <button id="chart-window-btn" class="ghost-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
                   <span id="chart-window-label">15 分钟</span>
                   <span class="caret">▾</span>
@@ -226,11 +229,25 @@
                   <button type="button" role="option" data-value="1440">24 小时</button>
                 </div>
               </div>
-              <span id="chart-max" class="dim">峰值 0</span>
-              <button id="btn-model-stats" class="ghost-btn" type="button" title="按模型分类的速度趋势与统计（最近 10 分钟 / 1 小时 / 6 小时）">模型详情</button>
+              <!-- 分段拨杆：整体曲线 / 模型详情两个视图互斥切换（记住选择）。
+                   文字分居左右，色块滑到激活一侧 -->
+              <button id="chart-view-toggle" class="view-toggle" type="button" role="switch" aria-checked="false" title="切换曲线卡视图：整体输出速度曲线 / 模型速度趋势（互斥显示，共用时间范围，记住选择）">
+                <span class="vt-knob" aria-hidden="true"></span>
+                <span class="vt-opt">整体曲线</span>
+                <span class="vt-opt">模型详情</span>
+              </button>
             </span>
           </div>
           <canvas id="spark"></canvas>
+          <!-- 模型详情视图：图例 chips + 按模型折线 + 统计条，与 #spark 互斥 -->
+          <div id="model-view">
+            <div id="model-legend"></div>
+            <div id="model-chart-wrap">
+              <canvas id="model-chart"></canvas>
+              <div id="model-empty">窗口内暂无调用数据</div>
+            </div>
+            <div id="model-summary"></div>
+          </div>
         </section>
         </div>
 
@@ -295,34 +312,7 @@
       <!-- mac 引导提示：应用常驻菜单栏（无 Dock 图标），窗口每次从隐藏到显示时出现，6 秒自动淡出 -->
       <div id="tray-hint" title="点击关闭">应用常驻菜单栏 ↗ 点菜单栏图标可显示面板 / 退出</div>
 
-      <!-- 模型速度趋势详情弹窗：三档时间窗 × 按模型折线与统计（只读查询 usage 库现算，零本地存储） -->
-      <div id="model-modal">
-        <div id="model-modal-box">
-          <div class="model-modal-head">
-            <span class="model-modal-title">模型速度趋势</span>
-            <div id="model-window" class="dropdown" title="统计窗口">
-              <button id="model-window-btn" class="ghost-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
-                <span id="model-window-label">最近 1 小时</span>
-                <span class="caret">▾</span>
-              </button>
-              <div id="model-window-list" class="dropdown-list" role="listbox" aria-label="统计窗口">
-                <button type="button" role="option" data-value="10">最近 10 分钟</button>
-                <button type="button" role="option" data-value="60" class="selected">最近 1 小时</button>
-                <button type="button" role="option" data-value="360">最近 6 小时</button>
-              </div>
-            </div>
-            <button id="model-modal-close" class="ghost-btn" type="button" title="关闭">✕</button>
-          </div>
-          <div id="model-legend"></div>
-          <div id="model-chart-wrap">
-            <canvas id="model-chart"></canvas>
-            <div id="model-empty">窗口内暂无调用数据</div>
-          </div>
-          <div id="model-summary"></div>
-        </div>
-      </div>
-
-      <!-- 快照防护确认弹窗：复用 #model-modal 的遮罩+卡片风格。开启必须
+      <!-- 快照防护确认弹窗：复用弹窗的遮罩+卡片风格。开启必须
            明示损失「检查点回滚 / 时间线」与"对话不受影响"（用户要求的
            知情同意，key-rules #15）；文案按动作在 guard.ts 里填充 -->
       <div id="guard-confirm">
@@ -341,7 +331,7 @@
         </div>
       </div>
 
-      <!-- 设置弹窗：模块显隐与排序 + 自动启动（顶栏 ⚙ 打开；复用模型详情弹窗的遮罩+卡片风格）。
+      <!-- 设置弹窗：模块显隐与排序 + 自动启动（顶栏 ⚙ 打开；复用弹窗的遮罩+卡片风格）。
            行由 main.ts 按 MODULE_DEFS 动态渲染：自绘勾选框（.pet-chk 同款）+ ↑↓ 排序，
            变更即时生效并存 localStorage（modules.v1）；自动启动三态行也由 main.ts 渲染，
            读写后端命令（Windows 注册表 / mac LaunchAgent 即事实源，不存 localStorage） -->

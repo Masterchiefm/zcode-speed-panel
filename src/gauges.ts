@@ -365,8 +365,10 @@ export class MiniGauge extends BaseGauge {
     if (!fit) return;
     const { ctx, w, h } = fit;
     const cx = w / 2;
-    const cy = h * 0.52;
     const r = Math.min(w, h) * 0.36;
+    // 弧线两端（135°/45° 端点 + 7px 圆头线帽的一半）锚在距画布底 8px——
+    // 与右上角"上轮"小环的 top:8px 对称（窗口 148×118，见 main.rs FLOAT_GAUGE_SIZE）
+    const cy = h - 8 - (r * Math.SQRT1_2 + 3.5);
 
     const frac = Math.max(0.0001, Math.min(1, this.value / this.max));
     // 背景轨道统一灰色

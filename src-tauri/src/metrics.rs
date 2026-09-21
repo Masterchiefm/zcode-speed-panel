@@ -699,7 +699,7 @@ impl Engine {
     /// 仅查询现算（零本地存储、不给 usage 库建索引/写入）；conn 缺失或查询失败
     /// 返回空 payload（不 panic）。聚合口径见 aggregate_model_stats
     pub fn model_stats(&self, window_min: i64) -> ModelStatsPayload {
-        let window_min = clamp_window_min(window_min);
+        let window_min = clamp_chart_window(window_min);
         let now = now_ms();
         let Some(conn) = &self.conn else {
             eprintln!("[zcode-speed-panel] model_stats: usage DB 不可用");
@@ -769,15 +769,12 @@ pub(crate) fn inflight_from_rows(
     out
 }
 
-// ============ 模型速度趋势（按模型 × 时间桶聚合，详情弹窗用，零本地存储） ============
-
-/// 合法统计窗口（分钟）：最近 10 分钟 / 1 小时 / 6 小时
-const MODEL_WINDOW_CHOICES: [i64; 3] = [10, 60, 360];
-/// 趋势图统一 60 桶（0 = 最新桶）
-const MODEL_BUCKETS: usize = 60;
+// ============ 模型速度趋势（按模型 × 时间桶聚合，曲线卡模型详情视图用，零本地存储） ============
+// 时间规格与下方 chart_stats 完全共用：同一组窗口档位（15/60/360/1440 分钟）、
+// 同一桶数（CHART_BUCKETS=90）与桶宽——两视图切换时横轴逐像素对齐，只换序列不换刻度
 
 /// 单模型单桶聚合
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelBucket {
     /// 该桶 tps = Σ(output+reasoning) ÷ Σ纯生成秒；无调用为 0
@@ -791,7 +788,7 @@ pub struct ModelBucket {
 #[serde(rename_all = "camelCase")]
 pub struct ModelSeries {
     pub model: String,
-    /// 恒 60 个，0 = 最新桶
+    /// 恒 CHART_BUCKETS（90）个，0 = 最新桶
     pub buckets: Vec<ModelBucket>,
     pub total_calls: u64,
     pub total_tokens: u64,
@@ -831,28 +828,25 @@ struct BucketAcc {
     calls: u64,
 }
 
-/// 非法窗口值归入最近的合法档位（10 / 60 / 360 分钟）
-fn clamp_window_min(window_min: i64) -> i64 {
-    MODEL_WINDOW_CHOICES
-        .iter()
-        .copied()
-        .min_by_key(|&w| (w - window_min).abs())
-        .unwrap_or(60)
-}
+/// 非法窗口值归入最近的合法档位：直接复用曲线的 clamp_chart_window
+/// （两视图同一组档位，见 CHART_WINDOW_CHOICES）
 
 /// 空 payload（conn 缺失 / 查询失败时返回，不 panic）
 fn empty_model_stats(window_min: i64, now_ms: i64) -> ModelStatsPayload {
     ModelStatsPayload {
         window_min,
-        bucket_ms: window_min * 60_000 / MODEL_BUCKETS as i64,
+        bucket_ms: window_min * 60_000 / CHART_BUCKETS as i64,
         now_ms,
         series: Vec::new(),
     }
 }
 
-/// 纯函数：把窗口内已完成的调用行聚合成按模型 60 桶的趋势与汇总（便于单测）。
-/// - 桶序号 = (now − completed) ÷ bucket_ms（div_euclid，未来时刻为负直接丢弃），
-///   0 = 最新桶、59 = 最旧桶，越界丢弃；
+/// 纯函数：把窗口内已完成的调用行聚合成按模型 90 桶的趋势与汇总（便于单测）。
+/// 时间规格（窗口档位 / 桶数 / 桶宽）与 aggregate_chart_stats 完全一致。
+/// - 桶序号 = now ÷ bucket_ms − completed ÷ bucket_ms（div_euclid，绝对墙钟槽
+///   对齐，与 chart_stats / 今日 spark 同口径：桶边界钉在真实时刻的整倍数上，
+///   两次查询落在同一槽内时桶内容完全一致——趋势随时间只平移不变形），
+///   0 = 最新桶、89 = 最旧桶，越界（含未来超过一槽）丢弃；
 /// - gen_ms = completed − first_token，first_token 缺失或非正退 duration_ms，
 ///   再 max(50) 兜底（与今日聚合同口径）；
 /// - eff = output + reasoning；桶 tps = Σeff ÷ Σgen_s，无调用为 0；
@@ -862,8 +856,8 @@ fn aggregate_model_stats(
     window_min: i64,
     now_ms: i64,
 ) -> ModelStatsPayload {
-    let window_min = clamp_window_min(window_min);
-    let bucket_ms = window_min * 60_000 / MODEL_BUCKETS as i64;
+    let window_min = clamp_chart_window(window_min);
+    let bucket_ms = window_min * 60_000 / CHART_BUCKETS as i64;
     // model -> (每桶累计, 总eff, 总gen_ms, 总调用数)
     let mut per_model: HashMap<String, (Vec<BucketAcc>, u64, i64, u64)> = HashMap::new();
     for r in rows {
@@ -873,13 +867,13 @@ fn aggregate_model_stats(
         }
         .max(MIN_DUR_MS);
         let eff = r.output_tokens + r.reasoning_tokens;
-        let slot = (now_ms - r.completed_at).div_euclid(bucket_ms);
-        if slot < 0 || slot as usize >= MODEL_BUCKETS {
+        let slot = now_ms.div_euclid(bucket_ms) - r.completed_at.div_euclid(bucket_ms);
+        if slot < 0 || slot as usize >= CHART_BUCKETS {
             continue;
         }
         let entry = per_model.entry(r.model).or_insert_with(|| {
             (
-                (0..MODEL_BUCKETS)
+                (0..CHART_BUCKETS)
                     .map(|_| BucketAcc { eff: 0, gen_ms: 0, calls: 0 })
                     .collect(),
                 0,
@@ -1202,10 +1196,11 @@ mod tests {
     }
 
     /// 两模型 × 两桶：tps/calls/tokens/avg/peak/share 正确、桶对齐、空桶为 0、
-    /// series 按 total_tokens 降序、窗口外（过早/未来）行丢弃
+    /// series 按 total_tokens 降序、窗口外（过早/未来跨槽）行丢弃。
+    /// now 取槽内中段（非边界对齐），与 chart_stats 测试同一约定
     #[test]
     fn model_stats_two_models_two_buckets() {
-        let now = 1_700_000_000_000i64;
+        let now = 1_700_000_005_000i64; // 10s 槽内第 5s（15 分钟档桶宽 10s）
         let rows = vec![
             // 模型 A：桶 0（gen 4s，eff 400 → 100 t/s）、桶 1（gen 1s，eff 100 → 100 t/s）
             mrow("model-a", now - 5_000, Some(now - 9_000), Some(9_000), 300, 100),
@@ -1214,12 +1209,12 @@ mod tests {
             // 桶 2（gen 3s，eff 1200 → 400 t/s）
             mrow("model-b", now - 5_000, None, Some(2_000), 400, 0),
             mrow("model-b", now - 25_000, Some(now - 28_000), None, 900, 300),
-            // 越界：早于窗口（桶 70）与未来时刻（div_euclid 为负），都应丢弃
-            mrow("model-a", now - 700_000, Some(now - 701_000), None, 999, 0),
-            mrow("model-a", now + 1_000, Some(now), None, 999, 0),
+            // 越界：早于窗口（槽 100 ≥ 90）与未来跨槽（槽为负），都应丢弃
+            mrow("model-a", now - 1_000_000, Some(now - 1_001_000), None, 999, 0),
+            mrow("model-a", now + 6_000, Some(now + 5_000), None, 999, 0),
         ];
-        let p = aggregate_model_stats(rows, 10, now);
-        assert_eq!(p.window_min, 10);
+        let p = aggregate_model_stats(rows, 15, now);
+        assert_eq!(p.window_min, 15);
         assert_eq!(p.bucket_ms, 10_000);
         assert_eq!(p.now_ms, now);
         // 按 total_tokens 降序：B(1600) 在前，A(500) 在后
@@ -1228,7 +1223,7 @@ mod tests {
         assert_eq!(p.series[1].model, "model-a");
 
         let b = &p.series[0];
-        assert_eq!(b.buckets.len(), 60);
+        assert_eq!(b.buckets.len(), 90);
         assert_eq!(b.total_calls, 2);
         assert_eq!(b.total_tokens, 1600);
         assert!((b.avg_tps - 1600.0 / 5.0).abs() < 1e-9); // Σeff 1600 ÷ 5s
@@ -1256,16 +1251,38 @@ mod tests {
         assert_eq!(a.buckets[2].calls, 0);
     }
 
-    /// 窗口 clamp（999→360、0→10、40→60、400→360）与 gen_ms 缺失退化
-    /// （first_token None → duration_ms → max(50) 兜底）
+    /// 墙钟对齐守护（与 chart_stats 同口径）：now 在同一绝对槽内滑动时桶内容
+    /// 完全不变——趋势随时间只应平移不应变形（此前按 (now−completed) 相对偏移
+    /// 分桶，桶边界随查询时刻漂移，调用会在相邻桶间跳动导致曲线每拍微变形）
+    #[test]
+    fn model_stats_wall_clock_aligned_buckets() {
+        let mk = || {
+            vec![
+                mrow("m", 1_700_000_002_000, Some(1_699_999_990_000), Some(12_000), 600, 0),
+                mrow("m", 1_699_999_990_000, Some(1_699_999_986_000), Some(4_000), 200, 0),
+            ]
+        };
+        // 两次 now 相差 5s，但同属绝对槽 [1_700_000_000_000, 1_700_000_010_000)
+        let a = aggregate_model_stats(mk(), 15, 1_700_000_003_000);
+        let b = aggregate_model_stats(mk(), 15, 1_700_000_008_000);
+        assert_eq!(a.bucket_ms, 10_000);
+        assert_eq!(a.series[0].buckets, b.series[0].buckets);
+        // 与绝对槽对齐一致：两条 completed 分别落最新桶（0）与次新桶（1）
+        assert!(a.series[0].buckets[0].tps > 0.0);
+        assert!(a.series[0].buckets[1].tps > 0.0);
+        assert_eq!(a.series[0].buckets[2].calls, 0);
+    }
+
+    /// 窗口 clamp（与曲线共用 clamp_chart_window：999→1440、0→15、40→60、400→360）
+    /// 与 gen_ms 缺失退化（first_token None → duration_ms → max(50) 兜底）
     #[test]
     fn model_stats_window_clamp_and_gen_fallback() {
-        assert_eq!(clamp_window_min(999), 360);
-        assert_eq!(clamp_window_min(0), 10);
-        assert_eq!(clamp_window_min(40), 60);
-        assert_eq!(clamp_window_min(400), 360);
-        assert_eq!(clamp_window_min(60), 60);
-        assert_eq!(clamp_window_min(360), 360);
+        assert_eq!(clamp_chart_window(999), 1440);
+        assert_eq!(clamp_chart_window(0), 15);
+        assert_eq!(clamp_chart_window(40), 60);
+        assert_eq!(clamp_chart_window(400), 360);
+        assert_eq!(clamp_chart_window(60), 60);
+        assert_eq!(clamp_chart_window(360), 360);
 
         let now = 1_700_000_000_000i64;
         let rows = vec![
@@ -1273,13 +1290,13 @@ mod tests {
             mrow("m", now - 6_000, None, None, 100, 0),        // duration 缺失 → 50ms
             mrow("m", now - 7_000, Some(now - 7_000), Some(0), 100, 0), // ft 非正（=completed）→ dur 0 非正 → 50ms
         ];
-        // window_min=999 归入 360（6 小时）：桶宽 360_000ms，三行都落最新桶
+        // window_min=999 归入 1440（24 小时）：桶宽 960_000ms，三行都落最新桶
         let p = aggregate_model_stats(rows, 999, now);
-        assert_eq!(p.window_min, 360);
-        assert_eq!(p.bucket_ms, 360_000);
+        assert_eq!(p.window_min, 1440);
+        assert_eq!(p.bucket_ms, 960_000);
         assert_eq!(p.series.len(), 1);
         let s = &p.series[0];
-        assert_eq!(s.buckets.len(), 60);
+        assert_eq!(s.buckets.len(), 90);
         assert_eq!(s.total_calls, 3);
         assert_eq!(s.total_tokens, 700);
         // Σeff 700 ÷ (5s + 50ms + 50ms)
@@ -1288,7 +1305,7 @@ mod tests {
         assert_eq!(s.peak_tps, s.buckets[0].tps);
         assert!((s.share - 1.0).abs() < 1e-9);
         // 空输入 → 空 series
-        let p = aggregate_model_stats(Vec::new(), 10, now);
+        let p = aggregate_model_stats(Vec::new(), 15, now);
         assert!(p.series.is_empty());
     }
 

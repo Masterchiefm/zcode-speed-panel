@@ -190,9 +190,11 @@ main {
   height: 210px;
 }
 
-/* 当前速度卡右上角的"上一轮调用速度"小圆环：小而独立，不占主表布局；
-   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角）。
-   inset 与左上角 ⟳ 按钮（8/8）呼应平衡，不贴卡片边缘 */
+/* 仪表卡顶角的角标小圆环（BadgeGauge）：小而独立，不占主表布局；
+   默认右上角（当前速度卡"上轮"、今日平均卡"历史"），今日平均卡的
+   "历史最高"用 .corner-left 放左上角对称。尺寸受卡片顶角留白限制
+   （窗口最小宽度 720 时主表弧线已贴近顶角）；左上角与 ⟳ 按钮不同卡、
+   无冲突。同类小环亦用于迷你仪表悬浮窗 */
 .gauge-card canvas.corner-gauge {
   position: absolute;
   top: 8px;
@@ -201,20 +203,10 @@ main {
   height: 56px;
 }
 
-/* 当前速度卡右下角的"历史最高速度"小圆环：底部区域弧线留白比顶部充裕
-   （弧底距卡底 ~40px），48px 不与主表弧线相碰；底部状态文字让位（见
-   .sub-badge 的右侧内边距） */
-.gauge-card canvas.corner-gauge.corner-bottom {
-  top: auto;
-  bottom: 8px;
-  width: 48px;
-  height: 48px;
-}
-
-/* 带右下角角标的卡：底部状态文字给角标让位（不换行省略号仍在，只是
-   可用宽度变窄；文案最长"生成中 · xx.x t/s 统计中"在最小卡宽下够用） */
-.gauge-card .sub.sub-badge {
-  padding-right: 58px;
+/* 今日平均卡左上角的"历史最高速度"小圆环：与右上角"历史平均"对称 */
+.gauge-card canvas.corner-gauge.corner-left {
+  right: auto;
+  left: 10px;
 }
 
 /* 当前速度卡左上角"重新校准"图标按钮（与右上角"上轮"角标呼应；宽度收窄，
@@ -872,7 +864,7 @@ body.float-mode.style-pill #float-pill {
   padding: 0 12px;
 }
 
-/* 主环占左侧 116px，右侧留给"上轮"小环（窗口 148×148 正方形，见 main.rs FLOAT_GAUGE_SIZE）；
+/* 主环占左侧 116px，右侧留给"上轮"小环（窗口 148×118，见 main.rs FLOAT_GAUGE_SIZE）；
    主环半径由画布尺寸推出，收窄画布宽度即同时缩小主环与速度数字 */
 #mini-gauge {
   width: 116px;
@@ -880,7 +872,8 @@ body.float-mode.style-pill #float-pill {
 }
 
 /* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小）；
-   top/right 对称留白，不贴窗边（原 right:4 太靠边） */
+   top/right 对称留白，不贴窗边（原 right:4 太靠边）；top:8px 同时是主环弧底
+   距窗口下边的距离（gauges.ts MiniGauge 锚定），两处须一致 */
 .float-badge {
   position: absolute;
   top: 8px;
@@ -1031,27 +1024,86 @@ body.float-mode #tray-hint {
   font-variant-numeric: tabular-nums;
 }
 
-#model-modal {
-  display: none;
-  position: fixed;
-  inset: 0;
-  z-index: 90;
-  align-items: center;
-  justify-content: center;
-  background: rgba(4, 8, 16, 0.55);
+/* ---- 曲线卡视图分段拨杆与模型详情视图（与整体输出速度曲线互斥，main.ts 切换） ---- */
+
+/* 分段拨杆：文字分居左右，色块滑到激活一侧（像开关）。两侧均为 4 字文案
+   等宽，滑块取半宽平移即可；发丝描边走 inset box-shadow，不占布局——
+   滑块宽度按 padding 盒的 50% 计算，左右各留 2px 边距恰好对称。
+   必须显式 border: none + appearance: none：这是裸 <button>，WebView2 会
+   套系统浅色主题的原生按钮浮雕边（常态上亮下暗、按压反转成下亮上暗），
+   在深色界面里是一圈刺白的边——与 key-rules #8 的原生控件同理，一律自绘 */
+.view-toggle {
+  appearance: none;
+  border: none;
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
 }
 
-#model-modal-box {
-  width: 90%;
-  max-width: 760px;
-  max-height: 80vh;
-  overflow: auto;
-  padding: 14px 18px 14px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(13, 20, 36, 0.97);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+.view-toggle:hover {
+  background: rgba(255, 255, 255, 0.09);
 }
+
+.view-toggle .vt-knob {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 2px);
+  border-radius: 999px;
+  /* 激活色块走主题同款淡青底 + 青描边（同下拉选中态/图例 chip 选中），
+     不用实色高亮——与其它按钮的克制风格一致 */
+  background: rgba(34, 211, 238, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.45);
+  transition: transform 0.15s;
+}
+
+.view-toggle.on .vt-knob {
+  transform: translateX(100%);
+}
+
+.view-toggle .vt-opt {
+  position: relative;
+  z-index: 1;
+  padding: 3px 12px;
+  color: var(--dim);
+  white-space: nowrap;
+  transition: color 0.15s;
+}
+
+/* 激活侧文字用主题青色（子元素序：1=滑块 2/3=两侧文字） */
+.view-toggle:not(.on) .vt-opt:nth-child(2),
+.view-toggle.on .vt-opt:nth-child(3) {
+  color: var(--cyan);
+  font-weight: 600;
+}
+
+/* 两视图互斥：整体曲线（#spark + 峰值标签）vs 模型详情（图例 + 折线 + 统计条）。
+   时间范围下拉两视图共用、恒显示——切换拨杆不改变统计范围。
+   #model-view 占满曲线卡剩余高度（同 #spark 的 flex:1 口径） */
+#model-view {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+body.chart-view-model #spark,
+body.chart-view-model #chart-max {
+  display: none;
+}
+
+body.chart-view-model #model-view {
+  display: flex;
+}
+
 /* ---- 应用内更新：footer 最右的版本号是检查入口，更新卡片与轻提示在其上方 ---- */
 
 #st-version {
@@ -1237,12 +1289,13 @@ body.float-mode #tray-hint {
   margin-right: auto;
 }
 
-/* 图例：一行彩色圆点 + 模型短名，可换行 */
+/* 图例：一行彩色圆点 + 模型短名，可换行（曲线卡模型详情视图内） */
 #model-legend {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
-  margin: 10px 0 4px;
+  margin: 2px 0 4px;
+  flex: none;
   font-size: 12px;
   color: var(--text);
 }
@@ -1308,13 +1361,20 @@ body.float-mode #tray-hint {
   flex: none;
 }
 
+/* 模型详情画布：占据图例与统计条之间的剩余高度（由 .chart-card canvas
+   的 flex:1 拉伸，容器自身也要参与 #model-view 的纵向分配） */
 #model-chart-wrap {
   position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 #model-chart {
   width: 100%;
-  height: 260px;
+  flex: 1;
+  min-height: 0;
   display: block;
 }
 
@@ -1335,7 +1395,8 @@ body.float-mode #tray-hint {
   display: flex;
   flex-wrap: wrap;
   gap: 6px 16px;
-  margin-top: 6px;
+  margin-top: 4px;
+  flex: none;
   font-size: 12px;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
@@ -1350,11 +1411,6 @@ body.float-mode #tray-hint {
 
 .model-stat-row span:last-child {
   color: var(--text);
-}
-
-/* 悬浮窗/桌宠模式窗口过小放不下弹窗：直接隐藏（JS 侧会同时停掉 5s 轮询） */
-body.float-mode #model-modal {
-  display: none !important;
 }
 
 /* ---- 快照防护与上传记录卡（guard.ts 控制区 + main.ts renderSnapshot 记录区）与确认弹窗 ---- */
@@ -1422,7 +1478,7 @@ body.float-mode #model-modal {
   line-height: 1.6;
 }
 
-/* 确认弹窗：复用模型详情弹窗的遮罩 + 卡片风格（开启/解除的知情同意） */
+/* 确认弹窗：复用通用弹窗的遮罩 + 卡片风格（开启/解除的知情同意） */
 #guard-confirm {
   display: none;
   position: fixed;

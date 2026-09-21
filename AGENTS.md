@@ -39,7 +39,7 @@ src-tauri/src/autostart.rs 自动启动：设置弹窗三态（关闭 / 开机�
 src-tauri/src/main.rs      应用层：轮询线程、更新检查线程、窗口模式/位置持久化、托盘（mac 菜单栏 + 动态 Dock 两态：完整面板 Regular/悬浮窗 Accessory）、DebugLog
 src-tauri/examples/        dump/verify 调试工具（#[path] include src，改公开 API 须同步）
 src-tauri/capabilities/    Tauri 前端权限白名单（窗口 API 必须在此放行）
-src/                       前端：main.ts 装配 + 模块显隐设置（顶栏 ⚙，localStorage modules.v1）+ 设置弹窗「自动启动」区（autostart_get/autostart_set）+ 快照卡记录区 renderSnapshot / gauges.ts 绘制 / model_stats.ts 模型趋势弹窗（图例 chips 多选）/ guard.ts 快照卡防护控制区 / pet.ts 桌宠 / mock.ts 预览
+src/                       前端：main.ts 装配 + 模块显隐设置（顶栏 ⚙，localStorage modules.v1）+ 设置弹窗「自动启动」区（autostart_get/autostart_set）+ 快照卡记录区 renderSnapshot / gauges.ts 绘制 / model_stats.ts 曲线卡「模型详情」视图（拨杆与整体曲线互斥切换，图例 chips 多选）/ guard.ts 快照卡防护控制区 / pet.ts 桌宠 / mock.ts 预览
 public/pets/               宠物包资源；scripts/*.py 调试日志分析；.github/workflows/ CI
 ```
 
