@@ -7,15 +7,18 @@
 
 <p><img src="app-icon.png" width="96" alt="应用图标" /></p>
 
-**手动安装**：[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)
+推荐两种方式安装：
+- **手动安装**：[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)
+  
+或者
 
-**让 ZCode 自动安装**：
+- **让 ZCode 自动安装**：（建议Mac用户使用）
 
 ```text
 请自行阅读https://github.com/Masterchiefm/zcode-speed-panel ，为用户安装。如果网络不好，善用代理或者ghproxy镜像。
 ```
 
-复制以上内容让 ZCode 帮你直接安装。
+复制以上提示词内容让 ZCode 帮你直接安装。
 
 ## 截图
 
