@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, NaiveTime, Utc};
+use chrono::{Datelike, Days, Local, NaiveTime, TimeZone, Utc};
 use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -109,12 +109,12 @@ pub struct Snapshot {
     /// 最近一次已完成调用的真实速度（落盘口径：输出+思考 ÷ 纯生成时长）。
     /// 今日无已完成调用时为 0；当前速度卡右上角的小表用它显示"上一轮"
     pub last_call_tps: f64,
-    /// 历史最高单调用速度（t/s）。准入口径见 HistoryStats（有效 first_token、
+    /// 近 7 日最高单调用速度（t/s）。准入口径见 HistoryStats（有效 first_token、
     /// 纯生成 ≥1s、有效输出 ≥300 token——毫秒级小调用时间戳噪声大，不入记录）。
-    /// 无合格调用时为 0；当前速度卡右下角小表"最高"显示
+    /// 窗口内无合格调用时为 0；当前速度卡右下角小表"最高"显示
     pub hist_max_tps: f64,
-    /// 历史平均速度：全部已完成调用 Σeff ÷ Σgen_s（与今日平均同口径，不过滤）。
-    /// 今日平均卡右上角小表"历史"显示
+    /// 近 7 日平均速度：窗口内已完成调用 Σeff ÷ Σgen_s（与今日平均同口径，
+    /// 不过滤；按本地日滑动过期）。今日平均卡右上角小表"历史"显示
     pub hist_avg_tps: f64,
     /// 当前速度来源："io"=进程流实测 / "window"=窗口回退 / "idle"=待机
     pub live_source: String,
@@ -185,14 +185,41 @@ fn now_ms() -> i64 {
 }
 
 fn local_midnight_utc_ms() -> i64 {
-    let now = Local::now();
-    let tz = now.timezone();
-    now.date_naive()
+    local_day_start_ms(Utc::now().timestamp_millis())
+}
+
+/// 某时间戳所在本地日的零点（UTC ms）。DST 歧义/不存在时刻回退 UTC 日界
+fn local_day_start_ms(ts_ms: i64) -> i64 {
+    let fallback = || ts_ms - ts_ms.rem_euclid(86_400_000);
+    let Some(dt) = Local.timestamp_millis_opt(ts_ms).single() else {
+        return fallback();
+    };
+    let tz = dt.timezone();
+    dt.date_naive()
         .and_time(NaiveTime::MIN)
         .and_local_timezone(tz)
         .single()
-        .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
-        .unwrap_or_else(|| now.timestamp_millis() - 86_400_000)
+        .map(|d| d.with_timezone(&Utc).timestamp_millis())
+        .unwrap_or_else(fallback)
+}
+
+/// 历史统计窗口起点（含）：今日往前 HIST_WINDOW_DAYS-1 个本地日的零点。
+/// 走日历日回退（Days::new）而非毫秒差——DST 会让毫秒差落到前后一天
+fn hist_window_cutoff(today_start_ms: i64) -> i64 {
+    let fallback = || today_start_ms - (HIST_WINDOW_DAYS - 1) * 86_400_000;
+    let Some(today) = Local.timestamp_millis_opt(today_start_ms).single() else {
+        return fallback();
+    };
+    let tz = today.timezone();
+    let Some(day) = today.date_naive().checked_sub_days(Days::new((HIST_WINDOW_DAYS - 1) as u64))
+    else {
+        return fallback();
+    };
+    day.and_time(NaiveTime::MIN)
+        .and_local_timezone(tz)
+        .single()
+        .map(|d| d.with_timezone(&Utc).timestamp_millis())
+        .unwrap_or_else(fallback)
 }
 
 /// 当日聚合器：持有今日全部调用，计算所有指标（纯函数，便于测试）
@@ -201,19 +228,34 @@ pub struct Aggregator {
     pub today_ymd: (i32, u32, u32),
 }
 
-/// 历史统计（全时段）：启动时对 usage 库做一次基线扫描（今日之前全部行），
-/// 之后随 poll 增量累计，跨天不重置。历史平均与今日平均同口径（不过滤）；
+/// 历史统计（近 HIST_WINDOW_DAYS 个本地自然日，含今日）：启动时对窗口内、
+/// 今日之前的行做一次基线扫描，之后随 poll 增量累计，并按本地日滑动过期——
+/// 跨过零点后最早的整日桶丢弃。历史平均与今日平均同口径（不过滤）；
 /// 历史最高带准入门槛——实测库中 24ms/79 token 一类小调用的毫秒级时间戳
-/// 噪声可产出上千 t/s 的假记录（与校准样本排除 <300 token 调用同理）
-#[derive(Clone, Copy, Debug, Default)]
+/// 噪声可产出上千 t/s 的假记录（与校准样本排除 <300 token 调用同理）。
+/// 按日分桶而非纯累加器，是为了过期时能把旧调用从 Σ 与峰值里退出去
+#[derive(Clone, Debug, Default)]
 pub struct HistoryStats {
-    /// 全部已完成调用 Σeff（历史平均分子）
+    /// 每日一桶（day_start 升序；基线按 completed_at ASC、增量只追加新日），
+    /// 只保留窗口内的日。聚合/淘汰与桶顺序无关
+    pub days: Vec<HistDay>,
+}
+
+/// 单日聚合桶：峰值/平均按日累计，过期整桶丢弃
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HistDay {
+    /// 本地日零点（UTC ms）
+    pub day_start: i64,
+    /// 当日已完成调用 Σeff（历史平均分子）
     pub total_eff: u64,
-    /// 全部已完成调用 Σgen_ms（历史平均分母；first_token 缺失退 duration 再 max(50)）
+    /// 当日 Σgen_ms（历史平均分母；first_token 缺失退 duration 再 max(50)）
     pub total_gen_ms: i64,
-    /// 历史最高单调用速度（t/s）：仅计入有效 first_token、gen≥1s 且 eff≥300 的调用
+    /// 当日最高单调用速度（t/s）：仅计入有效 first_token、gen≥1s 且 eff≥300 的调用
     pub max_tps: f64,
 }
+
+/// 历史统计窗口：近 7 个本地自然日（含今日），每日零点滑动过期
+pub const HIST_WINDOW_DAYS: i64 = 7;
 
 /// 历史最高准入：纯生成时长下限（ms）——短调用时间戳噪声大
 const HIST_MAX_MIN_GEN_MS: i64 = 1000;
@@ -221,27 +263,53 @@ const HIST_MAX_MIN_GEN_MS: i64 = 1000;
 const HIST_MAX_MIN_EFF: u64 = 300;
 
 impl HistoryStats {
-    /// 累计一次已完成调用（基线扫描与每拍增量共用）。gen_ms 为 poll 口径的
-    /// 最终值（ft 有效取 completed-ft，否则 duration 兜底再 max(50)）
-    pub fn fold(&mut self, ft: Option<i64>, completed_ms: i64, gen_ms: i64, eff: u64) {
-        self.total_eff += eff;
-        self.total_gen_ms += gen_ms.max(MIN_DUR_MS);
+    /// 过期清理：丢弃窗口起点（含）之前的整日桶（每拍调用，桶数 ≤ 窗口天数）
+    pub fn prune(&mut self, cutoff_day_start: i64) {
+        self.days.retain(|b| b.day_start >= cutoff_day_start);
+    }
+
+    /// 累计一次已完成调用到其所属本地日桶（基线扫描与每拍增量共用）。
+    /// gen_ms 为 poll 口径的最终值（ft 有效取 completed-ft，否则 duration 兜底再 max(50)）
+    pub fn fold(&mut self, day_start: i64, ft: Option<i64>, completed_ms: i64, gen_ms: i64, eff: u64) {
+        let idx = match self.days.iter().position(|b| b.day_start == day_start) {
+            Some(i) => i,
+            None => {
+                self.days.push(HistDay { day_start, ..Default::default() });
+                self.days.len() - 1
+            }
+        };
+        let b = &mut self.days[idx];
+        b.total_eff += eff;
+        b.total_gen_ms += gen_ms.max(MIN_DUR_MS);
         // 峰值记录准入：ft 必须真实有效（duration 兜底的行不可信）+ 双下限
         let real_ft = matches!(ft, Some(f) if completed_ms > f);
         if real_ft && gen_ms >= HIST_MAX_MIN_GEN_MS && eff >= HIST_MAX_MIN_EFF {
             let tps = eff as f64 * 1000.0 / gen_ms as f64;
-            if tps > self.max_tps {
-                self.max_tps = tps;
+            if tps > b.max_tps {
+                b.max_tps = tps;
             }
         }
     }
 
+    pub fn total_eff(&self) -> u64 {
+        self.days.iter().map(|b| b.total_eff).sum()
+    }
+
+    pub fn total_gen_ms(&self) -> i64 {
+        self.days.iter().map(|b| b.total_gen_ms).sum()
+    }
+
     pub fn avg_tps(&self) -> f64 {
-        if self.total_gen_ms > 0 {
-            self.total_eff as f64 / (self.total_gen_ms as f64 / 1000.0)
+        let gen = self.total_gen_ms();
+        if gen > 0 {
+            self.total_eff() as f64 / (gen as f64 / 1000.0)
         } else {
             0.0
         }
+    }
+
+    pub fn max_tps(&self) -> f64 {
+        self.days.iter().map(|b| b.max_tps).fold(0.0, f64::max)
     }
 }
 
@@ -450,8 +518,8 @@ pub struct Engine {
     conn: Option<rusqlite::Connection>,
     agg: Aggregator,
     ingested: HashSet<String>,
-    /// 历史统计（全时段）：首次 poll 时对今日之前的全部行做一次基线扫描，
-    /// 之后随每拍新增调用增量累计
+    /// 历史统计（近 7 个本地自然日）：首次 poll 时对窗口内、今日之前的行做
+    /// 一次基线扫描，之后随每拍新增调用增量累计并滑动过期
     hist: HistoryStats,
     hist_loaded: bool,
     pub db_path: Option<PathBuf>,
@@ -507,13 +575,15 @@ impl Engine {
         let Some(conn) = &self.conn else {
             return Vec::new();
         };
-        // 历史统计基线：首次 poll 扫描今日之前的全部已完成行（本地 SQLite 全表
-        // 一次读，实测 ~2 万行毫秒级；今日行由下方增量路径累计，不重复计入）。
-        // conn 与 hist 分字段借用，避免整个 self 的可变/不可变借用冲突
+        // 历史统计基线：首次 poll 扫描窗口内、今日之前的已完成行（本地 SQLite
+        // 一次读，毫秒级；今日行由下方增量路径累计，不重复计入）。conn 与 hist
+        // 分字段借用，避免整个 self 的可变/不可变借用冲突
         if !self.hist_loaded {
             self.hist_loaded = true;
             Self::scan_history_before(conn, &mut self.hist, today_start_ms);
         }
+        // 滑动过期：跨过零点最早的整日桶丢弃（每拍执行，桶数 ≤ 窗口天数）
+        self.hist.prune(hist_window_cutoff(today_start_ms));
         let mut new_calls = Vec::new();
         let sql = concat!(
             "SELECT id, started_at, first_token_at, completed_at, duration_ms, ",
@@ -571,9 +641,11 @@ impl Engine {
             }
             self.ingested.insert(id.clone());
             let gen_ms = gen_ms_from(ft, completed, dur);
-            // 历史统计增量累计（全时段不过滤；峰值走 HistoryStats::fold 的准入口径）
+            // 历史统计增量累计（今日调用必在窗口内；峰值走 HistoryStats::fold
+            // 的准入口径）
             let eff = out + reason;
-            self.hist.fold(ft, completed, gen_ms, eff);
+            let day = local_day_start_ms(completed);
+            self.hist.fold(day, ft, completed, gen_ms, eff);
             self.agg.ingest(Call {
                 id,
                 started_ms: started,
@@ -597,26 +669,29 @@ impl Engine {
     pub fn snapshot(&self) -> Snapshot {
         let mut s = self.agg.snapshot();
         s.rollout_dir = self.data_source_label();
-        s.hist_max_tps = self.hist.max_tps;
+        s.hist_max_tps = self.hist.max_tps();
         s.hist_avg_tps = self.hist.avg_tps();
         s
     }
 
-    /// 历史统计基线扫描：累计 completed_at 早于今日零点的全部已完成行。
+    /// 历史统计基线扫描：累计窗口起点（含）到今日零点之前的已完成行。
+    /// 窗口起点 = 今日零点往前 HIST_WINDOW_DAYS-1 个本地日（DST 安全），
+    /// 恰为本地日零点，故 completed_at >= 起点即"本地日在窗口内"。
     /// 失败只打日志不 panic（历史角标显示 0，今日增量路径照常）
     fn scan_history_before(
         conn: &rusqlite::Connection,
         hist: &mut HistoryStats,
         today_start_ms: i64,
     ) {
+        let cutoff = hist_window_cutoff(today_start_ms);
         let sql = concat!(
             "SELECT first_token_at, completed_at, duration_ms, ",
             "output_tokens, reasoning_tokens FROM model_usage ",
-            "WHERE status='completed' AND completed_at < ?1"
+            "WHERE status='completed' AND completed_at < ?1 AND completed_at >= ?2"
         );
         let mut query = || -> rusqlite::Result<()> {
             let mut stmt = conn.prepare_cached(sql)?;
-            let rows = stmt.query_map([today_start_ms], |r| {
+            let rows = stmt.query_map([today_start_ms, cutoff], |r| {
                 Ok((
                     r.get::<_, Option<i64>>(0)?,
                     r.get::<_, i64>(1)?,
@@ -628,7 +703,8 @@ impl Engine {
             for row in rows.flatten() {
                 let (ft, completed, dur, out, reason) = row;
                 let gen = gen_ms_from(ft, completed, dur);
-                hist.fold(ft, completed, gen, out + reason);
+                let day = local_day_start_ms(completed);
+                hist.fold(day, ft, completed, gen, out + reason);
             }
             Ok(())
         };
@@ -1314,30 +1390,60 @@ mod tests {
     #[test]
     fn history_stats_fold_and_admission() {
         let now = 1_700_000_000_000i64;
+        let day = 1_700_000_000_000i64 - now.rem_euclid(86_400_000); // 任意本地日占位
         let mut h = HistoryStats::default();
         // 正常大调用：1000 tok / 4s = 250 t/s，入峰值
-        h.fold(Some(now - 5_000), now - 1_000, 4_000, 1_000);
+        h.fold(day, Some(now - 5_000), now - 1_000, 4_000, 1_000);
         // 更快的小调用：300 tok / 1.05s ≈ 285.7 t/s，eff=300 达标 → 应刷新峰值
-        h.fold(Some(now - 3_000), now - 1_950, 1_050, 300);
-        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        h.fold(day, Some(now - 3_000), now - 1_950, 1_050, 300);
+        assert!((h.max_tps() - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
         // 假记录陷阱：79 tok / 24ms（真实库实测形态，1580 t/s）——eff 与时长双不足
-        h.fold(Some(now - 100), now - 76, 24, 79);
-        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        h.fold(day, Some(now - 100), now - 76, 24, 79);
+        assert!((h.max_tps() - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
         // eff 达标但时长不足（500 tok / 200ms = 2500 t/s）→ 不入
-        h.fold(Some(now - 300), now - 100, 200, 500);
-        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        h.fold(day, Some(now - 300), now - 100, 200, 500);
+        assert!((h.max_tps() - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
         // duration 兜底行（ft 缺失）计入平均但不入峰值
-        h.fold(None, now - 60_000, 10_000, 2_000);
-        assert!((h.max_tps - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
+        h.fold(day, None, now - 60_000, 10_000, 2_000);
+        assert!((h.max_tps() - 300.0 * 1000.0 / 1050.0).abs() < 1e-9);
         // 平均 = Σeff 3800 ÷ Σgen（24ms 行按 MIN_DUR_MS=50 进位）
         let total_eff = 1_000 + 300 + 79 + 500 + 2_000;
         let total_gen = 4_000 + 1_050 + 50 + 200 + 10_000;
         assert!((h.avg_tps() - total_eff as f64 / (total_gen as f64 / 1000.0)).abs() < 1e-9);
-        assert_eq!(h.total_eff, total_eff);
-        assert_eq!(h.total_gen_ms, total_gen);
+        assert_eq!(h.total_eff(), total_eff);
+        assert_eq!(h.total_gen_ms(), total_gen);
+        assert_eq!(h.days.len(), 1);
         // 空库
         assert_eq!(HistoryStats::default().avg_tps(), 0.0);
-        assert_eq!(HistoryStats::default().max_tps, 0.0);
+        assert_eq!(HistoryStats::default().max_tps(), 0.0);
+    }
+
+    /// 周窗口滑动过期：跨过窗口起点最早的整日桶丢弃，峰值/平均只由
+    /// 窗口内日桶聚合（起点恰为某日零点时该日保留）
+    #[test]
+    fn history_stats_week_window_prune() {
+        let day = 86_400_000i64 * 20_000; // 对齐日界的任意占位日零点
+        let mut h = HistoryStats::default();
+        // 三天各一条合格调用：首日最快 400 t/s（出窗后应消失），后两天 250 t/s
+        h.fold(day, Some(day + 1_000), day + 3_500, 2_500, 1_000);
+        h.fold(day + 86_400_000, Some(day + 86_400_001), day + 86_400_005, 4_000, 1_000);
+        h.fold(day + 2 * 86_400_000, Some(day + 2 * 86_400_001), day + 2 * 86_400_005, 4_000, 1_000);
+        assert_eq!(h.days.len(), 3);
+        assert!((h.max_tps() - 400.0).abs() < 1e-9);
+        // 窗口起点 = 第二天零点：首日整桶出窗（400 t/s 峰值随之消失），
+        // 起点所在日保留
+        h.prune(day + 86_400_000);
+        assert_eq!(h.days.len(), 2);
+        assert!((h.max_tps() - 250.0).abs() < 1e-9);
+        assert!((h.avg_tps() - 250.0).abs() < 1e-9);
+        // 平均按剩余桶重算：Σeff 2000 ÷ Σgen 8000ms
+        assert_eq!(h.total_eff(), 2_000);
+        assert_eq!(h.total_gen_ms(), 8_000);
+        // 起点推到三天后：全部出窗 → 归零（而非残留旧峰值）
+        h.prune(day + 3 * 86_400_000);
+        assert!(h.days.is_empty());
+        assert_eq!(h.max_tps(), 0.0);
+        assert_eq!(h.avg_tps(), 0.0);
     }
 
     /// 曲线聚合：90 桶、旧→新排列、越界丢弃、gen 兜底口径与今日 spark 一致。

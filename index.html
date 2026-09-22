@@ -89,13 +89,13 @@
             <canvas
               id="g-peak"
               class="corner-gauge corner-left"
-              title="历史最高速度：有效输出 ≥300 token 且纯生成 ≥1s 的调用中最快一次（毫秒级小调用时间戳噪声大，不计入记录）"
+              title="近 7 天最高速度：近 7 个自然日（含今日，每日零点滑动过期）内有效输出 ≥300 token 且纯生成 ≥1s 的调用中最快一次（毫秒级小调用时间戳噪声大，不计入记录）"
             ></canvas>
             <canvas id="g-avg"></canvas>
             <canvas
               id="g-histavg"
               class="corner-gauge"
-              title="历史平均速度：全部已完成调用 Σ(输出+思考) ÷ Σ纯生成时长（与今日平均同口径，不过滤）"
+              title="近 7 天平均速度：近 7 个自然日（含今日）内已完成调用 Σ(输出+思考) ÷ Σ纯生成时长（与今日平均同口径，不过滤，每日零点滑动过期）"
             ></canvas>
             <div class="sub" id="sub-avg">等待数据…</div>
           </div>

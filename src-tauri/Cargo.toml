@@ -1,6 +1,6 @@
 [package]
 name = "zcode-speed-panel"
-version = "0.4.5"
+version = "0.4.6"
 description = "ZCode 输出速度仪表盘（托盘常驻）"
 edition = "2021"
 rust-version = "1.77"

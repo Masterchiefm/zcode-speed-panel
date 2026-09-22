@@ -62,9 +62,9 @@ const gTotal = new ArcGauge($("g-total"), {
 
 // 当前速度卡右上角小表：最近一轮已完成调用的速度（落盘口径，非实时）
 const gLast = new BadgeGauge($("g-last"), { tiers: SPEED_TIERS });
-// 当前速度卡右下角小表：历史最高单调用速度（准入口径见 tooltip 与 metrics.rs）
+// 当前速度卡右下角小表：近 7 天最高单调用速度（窗口与准入口径见 tooltip 与 metrics.rs）
 const gPeak = new BadgeGauge($("g-peak"), { tiers: SPEED_TIERS, label: "最高" });
-// 今日平均卡右上角小表：历史平均速度（全部调用 Σeff ÷ Σgen，与今日平均同口径）
+// 今日平均卡右上角小表：近 7 天平均速度（窗口内调用 Σeff ÷ Σgen，与今日平均同口径）
 const gHistAvg = new BadgeGauge($("g-histavg"), { tiers: SPEED_TIERS, label: "历史" });
 
 const miniGauge = new MiniGauge($("mini-gauge"), { tiers: SPEED_TIERS });
