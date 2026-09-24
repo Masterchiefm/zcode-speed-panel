@@ -7,7 +7,7 @@ ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows / macOS 双平台�
 ```bash
 npx tsc --noEmit                    # 前端类型检查（改 src/*.ts 后必跑）
 npm run build                       # tsc + vite build
-cd src-tauri && cargo test          # Rust 单元测试（41 个，含合成端到端、更新/网络监控/快照防护纯函数）
+cd src-tauri && cargo test          # Rust 单元测试（57 个，含合成端到端、系数估计器基准 benchmark_*、更新/网络监控/快照防护纯函数）
 cd src-tauri && cargo check         # 后端编译检查
 npm run tauri dev                   # 开发运行（用户常驻一个 dev 实例，改码会热重启它）
 npm run tauri build                 # 正式版（Windows NSIS / macOS dmg，按宿主平台）
@@ -15,6 +15,7 @@ npm run tauri build                 # 正式版（Windows NSIS / macOS dmg，按
 rustup target add aarch64-apple-darwin
 MACOSX_DEPLOYMENT_TARGET=11.0 npm run tauri build -- --target aarch64-apple-darwin --bundles dmg
 python scripts/live_vs_true.py      # 对账：实时读数 vs 落盘真值
+python scripts/cal_bench.py         # 基准：校准系数估计器真实样本重放（改估计器前后必跑对表，key-rules #5）
 python scripts/estats_probe.py      # 复验 TCP ESTATS 每连接字节可用性（key-rules #14 证据；已定论普通权限不可用）
 ```
 
@@ -31,7 +32,7 @@ python scripts/estats_probe.py      # 复验 TCP ESTATS 每连接字节可用性
 
 ```
 src-tauri/src/metrics.rs   数据层：usage 库轮询 + 当日聚合（Engine/Aggregator，纯函数可测）
-src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windows 进程句柄 IO / macOS libproc+rusage）+ 平台参数化清洗（CleanParams）/积分/校准 + 多任务进程集合聚合（pick_pid_set/merge_streams，归属迟滞/跨进程样本守卫）+ 轮均速漂移自动重校准（RoundDrift）
+src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windows 进程句柄 IO / macOS libproc+rusage）+ 平台参数化清洗（CleanParams）/积分/真值校准（一致性校准样本 → cal_estimate 新近加权中位数估计器，精度基准 scripts/cal_bench.py + 测试 benchmark_*）+ 多任务进程集合聚合（pick_pid_set/merge_streams，归属迟滞/跨进程样本守卫）+ 轮均速漂移自动重校准（RoundDrift）
 src-tauri/src/netio.rs     网速监控：整机接口计数（win GetIfTable 32 位逐接口模差 / mac getifaddrs 去重）+ 会话/非会话上传拆分（token 估算 ≈ + checkpoints 工件真实下界）+ TCP 连接按进程分组（仅 win）+ 当日累计持久化
 src-tauri/src/snapshot_guard.rs  快照防护：锁定 ~/.zcode/v2/checkpoints 阻断工作区快照静默上传（mac chflags uchg / win icacls 拒绝 ACE·SID 必须 whoami 取·故意不拒删——拒 D 连读都会被以 DELETE 打开的工具阻断；写入探测定状态、calls 增量计轮次、guard.json 持久化；双平台）
 src-tauri/src/updater.rs   应用内更新：GitHub Releases 检查/下载/安装（纯函数 parse_version/is_newer/pick_asset 可测；产物命名耦合见 key-rules #12）

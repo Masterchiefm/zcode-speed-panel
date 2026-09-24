@@ -19,12 +19,20 @@
 //!   上传 ~190KB/拍与真实流式 ~52KB/拍可分；mac 流式本身就是单拍突发形态，
 //!   阈值在 CleanParams 中禁用）
 //! - 字节→token 换算【一致性校准】：调用完成后用 与显示路径完全相同的清洗流
-//!   在 [first_token, completed] 区间的积分字节 ÷ 真实 output_tokens 做滑动自校准。
+//!   在 [first_token, completed] 区间的积分字节 ÷ 真实 output_tokens 得到样本，
+//!   经准入后交给滑动估计器（[`cal_estimate`]）产出生效系数。
 //!   校准分子与显示分子同源，任何系统性扣除（噪声底/落盘/错位）都会被系数抵消，
 //!   显示值收敛到真实 t/s。历史教训：校准用未清洗的总字节流、显示用清洗后的流，
 //!   两条链路口径不一致曾导致系数被抬高 2~3 倍、读数系统性偏低。样本准入另带
 //!   跨进程守卫：窗口内其他进程字节占比过高（对方窗口并发流式）时拒收，防止
 //!   归因进程的积分混入外来字节污染系数。
+//!   估计器为「10 样本新近加权中位数 + 温和修剪」（[`cal_estimate`]）：
+//!   B/token 逐调用天然波动（本机 258 个真实样本 p25~p75 = 466~743、
+//!   极差 137~1591；lag-1 自相关 ≈0.50——连续调用共享内容风格，且与模型
+//!   无关：分模型校准经 scripts/cal_bench.py 重放验证无收益），估计器只能
+//!   压噪声不能消噪声。真实重放预测下一调用的相对误差：中位数从旧
+//!   5 样本中位数的 24.3% 降到 22.1%，p75 49.9%→47.8%（scripts/cal_bench.py，
+//!   即实时读数的系数误差上界；合成端到端基准见 liveio 测试 `benchmark_*`）。
 //!   mac 的磁盘写字节为页缓存异步落盘计数（滞后 write() 数秒~数十秒），校准
 //!   窗口延长到 completed + cal_grace_ms（延迟落盘宽限，Windows=0 当拍处理），
 //!   并对偏离生效系数超倍的样本做离群拒绝（Windows 禁用）。
@@ -366,15 +374,72 @@ pub(crate) fn integrate(rows: &[TickRow], from_ms: i64, to_ms: i64) -> (f64, f64
     (bytes, secs)
 }
 
-/// 校准系数维护：滑动窗口样本的中位数（纯函数便于测试）
-pub(crate) fn median_bpt(samples: &mut VecDeque<f64>, sample: f64, cap: usize) -> f64 {
-    samples.push_back(sample);
-    while samples.len() > cap {
-        samples.pop_front();
+/// 校准系数估计器（纯函数便于测试/基准重放）：滑动窗口上的**新近加权中位数**。
+///
+/// 背景（本机 258 个真实校准样本的实测结论，见 scripts/cal_bench.py）：B/token
+/// 样本逐调用天然大幅波动（p25~p75 = 466~743、lag-1 自相关 ≈0.50），任何预测器
+/// 都无法越过样本自身的噪声地板；旧「5 样本普通中位数」在真实重放里对下一调用
+/// 的预测误差中位数 24.3%，与「恒用先验 600」基线（26.1%）几乎无差——窗口太小
+/// 压不住噪声。本估计器三点改进：
+/// 1. 窗口 5 → 10（[`CAL_QUEUE_CAP`]）：更大的中位数窗，方差更低；
+/// 2. 新近加权：权重按半衰期 [`CAL_HALF_LIFE`] 个样本指数衰减——量级突变后
+///    新样本 2~3 个即跟上（不输旧 5 窗的自适应），稳态又有 10 样本的抗噪；
+/// 3. 温和修剪：以**未修剪加权中位数**为心（两遍法——若以窗口普通中位数
+///    为心，量级突变时新样本会被旧量级中位数误剪、系数被锁死在旧档），
+///    丢弃 [`CAL_TRIM_LO`]~[`CAL_TRIM_HI`] 倍之外的离群样本再取加权中位数，
+///    单条污染样本不再有能力大幅撼动系数。
+///
+/// `prior` 为平台先验（Windows 600 / mac 700）。窗口不足 [`CAL_SHRINK_N`]
+/// 个样本时按比例向先验收缩（冷启动单个异常样本无法独占系数——保持历史
+/// 性质；满 3 个后完全跟随数据）。真实重放（scripts/cal_bench.py，258 个
+/// 本机样本）：误差中位数 24.3%→22.1%、p75 49.9%→47.8%（win10/半衰期3/
+/// 修剪[0.4,2.5]，网格搜索最优平台）；合成基准见测试 `benchmark_*`。
+/// 样本须升序存放（ oldest→newest ），与 `cal` 队列及持久化文件同序
+pub(crate) fn cal_estimate(samples: &[f64], prior: f64) -> f64 {
+    let start = samples.len().saturating_sub(CAL_QUEUE_CAP);
+    let win = &samples[start..];
+    if win.is_empty() {
+        return prior;
     }
-    let mut sorted: Vec<f64> = samples.iter().copied().collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    sorted[sorted.len() / 2]
+    // 第一遍：未修剪的新近加权中位数，作为修剪中心（量级突变时它先跟上，
+    // 修剪才不会把新量级样本当离群误杀）
+    let center = weighted_median(win, |_| true);
+    if center <= 0.0 {
+        return prior;
+    }
+    // 第二遍：修剪离群后重取加权中位数
+    let est = weighted_median(win, |v| *v >= center * CAL_TRIM_LO && *v <= center * CAL_TRIM_HI);
+    // 冷启动向先验收缩：窗口样本数 < CAL_SHRINK_N 时线性过渡，满后纯数据
+    let shrink = (win.len() as f64 / CAL_SHRINK_N as f64).min(1.0);
+    est * shrink + prior * (1.0 - shrink)
+}
+
+/// 窗口内的新近加权中位数：`keep` 为样本过滤器（修剪用），最新样本权重 1、
+/// 每往前 [`CAL_HALF_LIFE`] 个减半；按值升序累计权重过半处取值。
+/// 窗口/留存样本恒为正（准入 `cal_sample` 与先验都保证），过滤器全空或
+/// 全负时回退窗口普通中位数兜底
+fn weighted_median(win: &[f64], keep: impl Fn(&f64) -> bool) -> f64 {
+    let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(win.len());
+    for (i, v) in win.iter().enumerate() {
+        if keep(v) {
+            pairs.push((*v, 0.5f64.powf((win.len() - 1 - i) as f64 / CAL_HALF_LIFE)));
+        }
+    }
+    if pairs.is_empty() {
+        let mut sorted: Vec<f64> = win.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        return sorted[sorted.len() / 2];
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total: f64 = pairs.iter().map(|p| p.1).sum();
+    let mut acc = 0.0;
+    for (v, w) in &pairs {
+        acc += w;
+        if acc >= total / 2.0 {
+            return *v;
+        }
+    }
+    pairs.last().map(|p| p.0).unwrap_or_else(|| pairs[0].0)
 }
 
 /// 实时显示的进程集合选择（纯函数便于测试）：
@@ -515,8 +580,20 @@ pub(crate) fn cal_sample(
     (in_range, ratio)
 }
 
-/// 校准样本队列容量（滑动窗口，含预置先验占位）
-const CAL_QUEUE_CAP: usize = 5;
+/// 校准样本队列容量（滑动窗口，含预置先验占位）。10 = 估计器的稳态窗口：
+/// 抗噪（旧 5 窗压不住真实样本 ±50% 的逐调用波动）与自适应（新近加权保证
+/// 突变后 2~3 个样本跟上）的平衡点，参数出处见 [`cal_estimate`] 文档
+const CAL_QUEUE_CAP: usize = 10;
+/// 新近加权半衰期（样本数）：最新权重 1，每往前 3 个样本权重减半
+const CAL_HALF_LIFE: f64 = 3.0;
+/// 温和修剪边界（修剪中心的倍数，中心 = 未修剪加权中位数，见 `cal_estimate`
+/// 两遍法）：离群样本不进加权中位数。边界放宽到 [0.4, 2.5]——真值样本本身
+/// 波动即近半，剪狠了会把真实量级变化当离群丢掉（自适应反而靠新近权重完成）
+const CAL_TRIM_LO: f64 = 0.4;
+const CAL_TRIM_HI: f64 = 2.5;
+/// 冷启动先验收缩的样本数上限：窗口不足该数时按比例向先验过渡，
+/// 满 3 个后完全跟随数据（保持「单个异常样本无法独占系数」的历史性质）
+const CAL_SHRINK_N: usize = 3;
 
 /// 启动提示判定（纯函数）：门控开启、尚无流式锚点（首字节未到）且距调用开始
 /// 仍在提示窗口内。窗口外保持无锚点 = 管道静默调用，由上层回退到估算显示
@@ -1173,10 +1250,10 @@ pub struct LiveIo {
 
 impl LiveIo {
     pub fn new() -> Self {
-        // 系数队列预置默认值为先验样本：冷启动阶段单个异常样本无法独占中位数，
-        // 需要 2 个真实样本才能推动系数；满 5 个样本后先验自然被挤出
+        // 系数队列预置默认值为先验样本：冷启动阶段（窗口 < 3 样本）估计器向
+        // 先验收缩，单个异常样本无法独占系数；先验占位随窗口滑动自然被挤出
         let params = CleanParams::platform();
-        let mut cal = VecDeque::with_capacity(5);
+        let mut cal = VecDeque::with_capacity(CAL_QUEUE_CAP);
         cal.push_back(params.default_bpt);
         Self {
             procs: HashMap::new(),
@@ -1270,7 +1347,7 @@ impl LiveIo {
     }
 
     /// 从持久化恢复系数样本：只收值域内的有限值，注入队列（容量与实时校准
-    /// 一致，超出丢最旧），生效系数取恢复后队列的上中位数（与校准路径同
+    /// 一致，超出丢最旧），生效系数取恢复后队列的估计器输出（与校准路径同
     /// 口径）。空/全非法时保持先验不动，返回实际接受数
     pub fn restore_cal(&mut self, samples: Vec<f64>) -> usize {
         let valid: Vec<f64> = samples
@@ -1284,9 +1361,7 @@ impl LiveIo {
         while self.cal.len() > CAL_QUEUE_CAP {
             self.cal.pop_front();
         }
-        let mut sorted: Vec<f64> = self.cal.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        self.bytes_per_token = sorted[sorted.len() / 2];
+        self.bytes_per_token = cal_estimate(self.cal.make_contiguous(), self.params.default_bpt);
         n
     }
 
@@ -1472,7 +1547,11 @@ impl LiveIo {
                 in_cal = false;
             }
             if in_cal {
-                self.bytes_per_token = median_bpt(&mut self.cal, bpt_sample, CAL_QUEUE_CAP);
+                self.cal.push_back(bpt_sample);
+                while self.cal.len() > CAL_QUEUE_CAP {
+                    self.cal.pop_front();
+                }
+                self.bytes_per_token = cal_estimate(self.cal.make_contiguous(), self.params.default_bpt);
             }
             self.pending_cal = Some(CalEvent {
                 id: call.id.clone(),
@@ -1906,26 +1985,35 @@ mod tests {
     }
 
     #[test]
-    fn median_bpt_sliding() {
-        let mut s = VecDeque::new();
-        assert!((median_bpt(&mut s, 600.0, 5) - 600.0).abs() < 1e-9);
-        median_bpt(&mut s, 800.0, 5);
-        median_bpt(&mut s, 400.0, 5);
-        assert_eq!(s.len(), 3);
-        // 奇数个样本取正中；偶数个取上中位元素（[400,500,600,800] → 600）
-        assert!((median_bpt(&mut s, 500.0, 5) - 600.0).abs() < 1e-9);
+    fn cal_estimate_weighted_median_basics() {
+        // 满窗一致样本 → 完全等于该值
+        let s: Vec<f64> = vec![560.0; 10];
+        assert!((cal_estimate(&s, 600.0) - 560.0).abs() < 1e-9);
+        // 新近加权：末尾 3 个新量级样本（权重 1+.79+.63=2.42）压过 7 个旧量级
+        //（权重和 1.94）——量级突变后 3 个样本跟上，自适应不被窗口拖慢
+        let mut s: Vec<f64> = vec![560.0; 7];
+        s.extend([200.0; 3]);
+        assert!((cal_estimate(&s, 600.0) - 200.0).abs() < 1e-9);
+        // 温和修剪：单条离群样本（0.23×，半截/静默类垃圾）不拉偏系数
+        let mut s: Vec<f64> = vec![560.0; 9];
+        s.push(130.0);
+        assert!((cal_estimate(&s, 600.0) - 560.0).abs() < 1e-9);
+        // 空窗口回先验
+        assert!((cal_estimate(&[], 600.0) - 600.0).abs() < 1e-9);
     }
 
+    /// 冷启动保护保持历史性质：预置先验后，单个异常样本（如 bpt=179）经
+    /// 先验收缩只能部分拉动系数（≈319，而非独占到 179）；两个一致样本后
+    /// 完全跟随数据，且修剪把离群样本剔出加权
     #[test]
-    fn prior_sample_prevents_single_sample_takeover() {
-        // 冷启动：预置先验后，单个异常样本（如 bpt=179）不能独占系数
-        let mut s = VecDeque::new();
-        s.push_back(DEFAULT_BPT);
-        let b1 = median_bpt(&mut s, 179.0, 5);
-        assert!((b1 - DEFAULT_BPT).abs() < 1e-9, "单个样本不应撼动先验: {b1}");
-        // 两个真实样本开始推动中位数（[179, 552, 600] → 552）
-        let b2 = median_bpt(&mut s, 552.0, 5);
-        assert!((b2 - 552.0).abs() < 1e-9);
+    fn cold_start_prior_shrinks_single_sample() {
+        let mut s: Vec<f64> = vec![600.0];
+        s.push(179.0);
+        let e1 = cal_estimate(&s, 600.0);
+        assert!((e1 - 179.0 * (2.0 / 3.0) - 600.0 / 3.0).abs() < 1e-9, "{e1}");
+        s.push(552.0);
+        let e2 = cal_estimate(&s, 600.0);
+        assert!((e2 - 552.0).abs() < 1e-9, "满 3 样本应完全跟随数据: {e2}");
     }
 
     #[test]
@@ -2036,27 +2124,34 @@ mod tests {
         assert!((io.bytes_per_token - io.params.default_bpt).abs() < 1e-9);
     }
 
-    /// 重启恢复：越界/非有限值拒收，生效系数按恢复后队列的上中位数重算
-    /// （与校准路径同口径）；空恢复不动先验
+    /// 重启恢复：越界/非有限值拒收，生效系数按恢复后队列的估计器输出重算
+    /// （与校准路径同口径）；空恢复不动状态。窗口容量 10 时旧样本与先验
+    /// 占位共存的队列不触发挤出
     #[test]
     fn restore_cal_filters_and_recomputes_median() {
         let mut io = LiveIo::new();
         // 30 越下界、99999 越上界（两平台 CAL_MAX 上界之上）、NaN 非有限 → 拒；
-        // 500/540 入队得 [先验,500,540]
+        // 500/540 入队得 [先验600,500,540]
         let n = io.restore_cal(vec![500.0, 540.0, 30.0, 99_999.0, f64::NAN]);
         assert_eq!(n, 2);
+        // 加权中位数（新近权重 1/.79/.63）落在 540；满 3 样本无先验收缩
         assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
         // 空恢复不动状态
         assert_eq!(io.restore_cal(vec![]), 0);
         assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
-        // 容量挤出：再注入 5 个合法值，队列保最新 5 个（600/500/540 被挤出）
-        let q0 = io.cal_state();
-        assert_eq!(q0.len(), 3);
+        // 再注入 5 个合法值：容量 10 内不挤出，队列 = [600,500,540,450..490]
         io.restore_cal(vec![450.0, 460.0, 470.0, 480.0, 490.0]);
+        assert_eq!(io.cal_state().len(), 8);
+        assert!(io.cal_state().contains(&io.params.default_bpt), "容量内先验占位保留");
+        // 未修剪加权中位数 480（新近权重主导）＝修剪中心，修剪后不变
+        assert!((io.bytes_per_token() - 480.0).abs() < 1e-9);
+        // 容量挤出：再注入 5 个，队列保最新 10 个（600/500/540 被挤出）
+        io.restore_cal(vec![510.0, 520.0, 530.0, 525.0, 515.0]);
         assert_eq!(io.cal_state().len(), CAL_QUEUE_CAP);
         assert!(!io.cal_state().contains(&io.params.default_bpt));
-        // [450,460,470,480,490] 上中位 = 470
-        assert!((io.bytes_per_token() - 470.0).abs() < 1e-9);
+        // 最新样本 510~530 权重占优，估计落在它们中间
+        let est = io.bytes_per_token();
+        assert!((510.0..=530.0).contains(&est), "估计应在新样本量级内: {est}");
     }
 
     /// 样本准入用例取自真实调试日志（2026-09-17 现场）：
@@ -2233,6 +2328,142 @@ mod tests {
             "校准后显示 {shown:.1} 应接近真值 {TRUE_TPS}"
         );
     }
+
+    // ============ 基准：系数估计器新旧对比（合成序列，确定性种子） ============
+    // `cargo test --release -p zcode-speed-panel --lib -- benchmark --nocapture`
+    // 打印误差表。绝对数字以真实数据重放为准（scripts/cal_bench.py，本机
+    // 249 个真实校准样本：旧 5 样本中位数中位误差 24.3% → 新估计器 20.8%）；
+    // 这里的断言只锁相对关系（新 ≤ 旧 / 收敛不劣化 / 抗离群），种子固定可复现
+
+    /// 确定性伪随机（LCG），保证测试可复现
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// 近似标准正态（3 个均匀和标准化）
+        fn next_normal(&mut self) -> f64 {
+            (self.next_f64() + self.next_f64() + self.next_f64() - 1.5) * 2.0
+        }
+    }
+
+    /// 旧估计器重放：最近 5 样本普通中位数（含先验占位的历史口径）
+    fn replay_old(samples: &[f64]) -> Vec<f64> {
+        let mut errs = Vec::new();
+        for i in 1..samples.len() {
+            let mut q: Vec<f64> = samples[..i].to_vec();
+            if q.len() > 5 {
+                q = q[q.len() - 5..].to_vec();
+            }
+            q.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let f = q[q.len() / 2];
+            errs.push((f - samples[i]).abs() / samples[i]);
+        }
+        errs
+    }
+
+    /// 新估计器重放：cal_estimate（先验 600）
+    fn replay_new(samples: &[f64]) -> Vec<f64> {
+        let mut errs = Vec::new();
+        for i in 1..samples.len() {
+            let f = cal_estimate(&samples[..i], DEFAULT_BPT);
+            errs.push((f - samples[i]).abs() / samples[i]);
+        }
+        errs
+    }
+
+    fn summarize(name: &str, errs: &mut [f64]) {
+        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = errs[errs.len() / 2];
+        let p75 = errs[errs.len() * 3 / 4];
+        let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+        println!("{name:<26} med={:>5.1}%  p75={:>5.1}%  mean={:>5.1}%", med * 100.0, p75 * 100.0, mean * 100.0);
+    }
+
+    /// 稳态噪声 + 短程相关：样本分布对齐真实日志——对数正态边缘 σ≈0.39
+    /// （复现 p25~p75 = 478~773 / 中位 563）叠加 lag-1 自相关 ρ=0.5（实测
+    /// 0.50,10 分钟内 0.54:连续调用共享内容风格）。新近加权正是靠这份
+    /// 相关性取胜；断言新估计器误差全面不高于旧
+    #[test]
+    fn benchmark_steady_state_new_beats_old() {
+        let mut rng = Lcg(0x5EED_2026_0924);
+        let base = 560.0f64;
+        let (rho, sigma) = (0.5f64, 0.39f64);
+        let innov = sigma * (1.0 - rho * rho).sqrt();
+        let mut z = 0.0f64;
+        let samples: Vec<f64> = (0..200)
+            .map(|_| {
+                z = rho * z + innov * rng.next_normal();
+                base * z.exp()
+            })
+            .collect();
+        let mut old = replay_old(&samples);
+        let mut new = replay_new(&samples);
+        summarize("稳态 旧 median-5", &mut old);
+        summarize("稳态 新 cal_estimate", &mut new);
+        old.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        new.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (om, on) = (old[old.len() / 2], new[new.len() / 2]);
+        assert!(
+            on <= om + 1e-9,
+            "新估计器中位误差 {on:.3} 应 ≤ 旧 {om:.3}"
+        );
+    }
+
+    /// 量级突变（换模型/分词器：560 → 200）：新估计器收敛不劣于旧 5 窗
+    /// （新近加权保证），容 2 个样本的余量
+    #[test]
+    fn benchmark_regime_shift_convergence() {
+        let mut rng = Lcg(0xA11CE);
+        let mut samples: Vec<f64> = (0..60)
+            .map(|_| 560.0 * (0.2 * rng.next_normal()).exp())
+            .collect();
+        samples.extend((0..60).map(|_| 200.0 * (0.2 * rng.next_normal()).exp()));
+        let conv = |errs: &[f64]| -> usize {
+            // 突变点(60)之后,首次连续 3 拍误差 <15% 的位置
+            for (k, w) in errs[60..].windows(3).enumerate() {
+                if w.iter().all(|e| *e < 0.15) {
+                    return 60 + k;
+                }
+            }
+            usize::MAX
+        };
+        let (old, new) = (replay_old(&samples), replay_new(&samples));
+        let (co, cn) = (conv(&old), conv(&new));
+        println!("突变收敛: 旧={}拍 新={}拍 (突变为第 60 样本)", co.saturating_sub(60), cn.saturating_sub(60));
+        assert!(cn != usize::MAX && co != usize::MAX, "两者都应收敛");
+        assert!(cn <= co + 2, "新估计器收敛不应明显慢于旧: 新{cn} 旧{co}");
+    }
+
+    /// 离群污染：每 10 个样本混入一条 ×0.45 的垃圾样本（准入可放行的
+    /// 半截样本形态）。10% 污染下 5 窗普通中位数的中位数仍扛得住（要 >2/5
+    /// 才翻车），两边的 med 打平——修剪的收益在尾部：断言 p75 与 mean
+    /// 新 ≤ 旧（污染样本不再把系数拖向垃圾量级）
+    #[test]
+    fn benchmark_outlier_resistance() {
+        let mut rng = Lcg(0xBEEF);
+        let mut samples: Vec<f64> = (0..200)
+            .map(|i| {
+                let s = 560.0 * (0.15 * rng.next_normal()).exp();
+                if i % 10 == 7 { s * 0.45 } else { s }
+            })
+            .collect();
+        samples[0] = 560.0; // 首样本固定,避免纯随机抖动
+        let (mut old, mut new) = (replay_old(&samples), replay_new(&samples));
+        summarize("离群 旧 median-5", &mut old);
+        summarize("离群 新 cal_estimate", &mut new);
+        let op = old[old.len() * 3 / 4];
+        let np = new[new.len() * 3 / 4];
+        assert!(np <= op + 1e-9, "离群场景 p75 新应不劣于旧: {np:.3} vs {op:.3}");
+        let om: f64 = old.iter().sum::<f64>() / old.len() as f64;
+        let nm: f64 = new.iter().sum::<f64>() / new.len() as f64;
+        assert!(nm <= om + 1e-9, "离群场景均值新应不劣于旧: {nm:.3} vs {om:.3}");
+    }
+
 
     /// 落盘 flush 延迟成大块（错位最恶劣情形）：正负拍在区间总和对消，
     /// 一致性校准仍收敛到真值
