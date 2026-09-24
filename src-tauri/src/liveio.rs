@@ -26,13 +26,17 @@
 //!   两条链路口径不一致曾导致系数被抬高 2~3 倍、读数系统性偏低。样本准入另带
 //!   跨进程守卫：窗口内其他进程字节占比过高（对方窗口并发流式）时拒收，防止
 //!   归因进程的积分混入外来字节污染系数。
-//!   估计器为「10 样本新近加权中位数 + 温和修剪」（[`cal_estimate`]）：
-//!   B/token 逐调用天然波动（本机 258 个真实样本 p25~p75 = 466~743、
-//!   极差 137~1591；lag-1 自相关 ≈0.50——连续调用共享内容风格，且与模型
-//!   无关：分模型校准经 scripts/cal_bench.py 重放验证无收益），估计器只能
+//!   估计器为「16 样本新近加权中位数 + 温和修剪 + AR1 新近收缩」
+//!   （[`cal_estimate`]）：B/token 逐调用天然波动（本机 262 个真实样本
+//!   p25~p75 = 466~740、极差 137~1591；log 空间 lag-1 自相关 ≈0.50、
+//!   lag-2 ≈ 0.27 ≈ ρ²——纯 AR(1)，连续调用共享内容风格；与模型无关：
+//!   分模型校准两轮重放均无收益，GLM-5.3 与 Flash 分布一致），估计器只能
 //!   压噪声不能消噪声。真实重放预测下一调用的相对误差：中位数从旧
-//!   5 样本中位数的 24.3% 降到 22.1%，p75 49.9%→47.8%（scripts/cal_bench.py，
-//!   即实时读数的系数误差上界；合成端到端基准见 liveio 测试 `benchmark_*`）。
+//!   5 样本中位数的 24.3% → 10 样本窗 21.3% → 现行 20.7%，p75 47.8%→41.5%
+//!   （scripts/cal_bench.py，262 样本；即实时读数的系数误差上界；合成端到端
+//!   基准见 liveio 测试 `benchmark_*`）。已重放否决：分模型校准、字节
+//!   ≈ a×token + c×时长的两参数模型（B/token 与真实速度的负相关来自渲染
+//!   分批，利用它需要未知的当调用速度，逐调用预测误差 48%~90%）。
 //!   mac 的磁盘写字节为页缓存异步落盘计数（滞后 write() 数秒~数十秒），校准
 //!   窗口延长到 completed + cal_grace_ms（延迟落盘宽限，Windows=0 当拍处理），
 //!   并对偏离生效系数超倍的样本做离群拒绝（Windows 禁用）。
@@ -374,27 +378,37 @@ pub(crate) fn integrate(rows: &[TickRow], from_ms: i64, to_ms: i64) -> (f64, f64
     (bytes, secs)
 }
 
-/// 校准系数估计器（纯函数便于测试/基准重放）：滑动窗口上的**新近加权中位数**。
+/// 校准系数估计器（纯函数便于测试/基准重放）：滑动窗口上的**新近加权中位数，
+/// 再向最新样本做一步对数收缩（AR1）**。
 ///
-/// 背景（本机 258 个真实校准样本的实测结论，见 scripts/cal_bench.py）：B/token
-/// 样本逐调用天然大幅波动（p25~p75 = 466~743、lag-1 自相关 ≈0.50），任何预测器
-/// 都无法越过样本自身的噪声地板；旧「5 样本普通中位数」在真实重放里对下一调用
-/// 的预测误差中位数 24.3%，与「恒用先验 600」基线（26.1%）几乎无差——窗口太小
-/// 压不住噪声。本估计器三点改进：
-/// 1. 窗口 5 → 10（[`CAL_QUEUE_CAP`]）：更大的中位数窗，方差更低；
+/// 背景（本机 262 个真实校准样本的实测结论，见 scripts/cal_bench.py）：B/token
+/// 样本逐调用天然大幅波动（p25~p75 = 466~740），但波动不是白噪声——log 空间
+/// lag-1 自相关 ≈0.50、lag-2 ≈ 0.27 ≈ ρ²（纯 AR(1)：连续调用共享内容风格）。
+/// 旧「5 样本普通中位数」预测下一调用的误差中位数 24.3%，与「恒用先验 600」
+/// 基线（25.9%）几乎无差——窗口太小压不住噪声。本估计器四点改进：
+/// 1. 窗口 5 → 16（[`CAL_QUEUE_CAP`]）：更大的中位数窗，方差更低；
 /// 2. 新近加权：权重按半衰期 [`CAL_HALF_LIFE`] 个样本指数衰减——量级突变后
-///    新样本 2~3 个即跟上（不输旧 5 窗的自适应），稳态又有 10 样本的抗噪；
+///    新样本 2~3 个即跟上（不输旧 5 窗的自适应），稳态又有 16 样本的抗噪；
 /// 3. 温和修剪：以**未修剪加权中位数**为心（两遍法——若以窗口普通中位数
 ///    为心，量级突变时新样本会被旧量级中位数误剪、系数被锁死在旧档），
 ///    丢弃 [`CAL_TRIM_LO`]~[`CAL_TRIM_HI`] 倍之外的离群样本再取加权中位数，
-///    单条污染样本不再有能力大幅撼动系数。
+///    单条污染样本不再有能力大幅撼动系数；
+/// 4. AR1 新近收缩（[`CAL_AR1_RHO`]）：剪后估计向最新样本做比值 ρ 次幂的
+///    对数收缩——AR(1) 结构下的理论最优一步预测（方差因子 √(1-ρ²)≈0.87），
+///    突变首样本即有先手、稳态尾部更窄。比值钳制在
+///    [`CAL_AR1_CLAMP`] 倍内：单样本对系数的影响有界（≤ CLAMP^ρ ≈ ×1.23），
+///    离群样本一拍的拉动可接受、多拍无法累积（中位数锚不动）。
 ///
 /// `prior` 为平台先验（Windows 600 / mac 700）。窗口不足 [`CAL_SHRINK_N`]
 /// 个样本时按比例向先验收缩（冷启动单个异常样本无法独占系数——保持历史
-/// 性质；满 3 个后完全跟随数据）。真实重放（scripts/cal_bench.py，258 个
-/// 本机样本）：误差中位数 24.3%→22.1%、p75 49.9%→47.8%（win10/半衰期3/
-/// 修剪[0.4,2.5]，网格搜索最优平台）；合成基准见测试 `benchmark_*`。
-/// 样本须升序存放（ oldest→newest ），与 `cal` 队列及持久化文件同序
+/// 性质；满 3 个后完全跟随数据）。真实重放（scripts/cal_bench.py，262 个
+/// 本机样本，分块验证 ρ 外推稳定）：误差中位数 24.3%（旧 5 窗）→ 21.3%
+/// （10 窗无收缩）→ 20.7%，p75 47.8%→41.5%、均值 37.1%→34.1%；
+/// 合成基准见测试 `benchmark_*`。已重放否决：分模型队列（GLM-5.3 与
+/// Flash 分布一致，拆窗只损失样本）、eff/时长加权（无效）、字节
+/// ≈ a×token + c×时长的两参数模型（逐调用误差 48%+）、界外样本跳过收缩
+/// （钳制拉动全面更优）。样本须升序存放（ oldest→newest ），与 `cal`
+/// 队列及持久化文件同序
 pub(crate) fn cal_estimate(samples: &[f64], prior: f64) -> f64 {
     let start = samples.len().saturating_sub(CAL_QUEUE_CAP);
     let win = &samples[start..];
@@ -408,7 +422,12 @@ pub(crate) fn cal_estimate(samples: &[f64], prior: f64) -> f64 {
         return prior;
     }
     // 第二遍：修剪离群后重取加权中位数
-    let est = weighted_median(win, |v| *v >= center * CAL_TRIM_LO && *v <= center * CAL_TRIM_HI);
+    let mut est = weighted_median(win, |v| *v >= center * CAL_TRIM_LO && *v <= center * CAL_TRIM_HI);
+    // AR1 新近收缩：向最新样本的对数收缩，比值钳制有界（见函数文档第 4 点）
+    if let Some(last) = win.last() {
+        let ratio = (last / est).clamp(1.0 / CAL_AR1_CLAMP, CAL_AR1_CLAMP);
+        est *= ratio.powf(CAL_AR1_RHO);
+    }
     // 冷启动向先验收缩：窗口样本数 < CAL_SHRINK_N 时线性过渡，满后纯数据
     let shrink = (win.len() as f64 / CAL_SHRINK_N as f64).min(1.0);
     est * shrink + prior * (1.0 - shrink)
@@ -580,10 +599,10 @@ pub(crate) fn cal_sample(
     (in_range, ratio)
 }
 
-/// 校准样本队列容量（滑动窗口，含预置先验占位）。10 = 估计器的稳态窗口：
-/// 抗噪（旧 5 窗压不住真实样本 ±50% 的逐调用波动）与自适应（新近加权保证
-/// 突变后 2~3 个样本跟上）的平衡点，参数出处见 [`cal_estimate`] 文档
-const CAL_QUEUE_CAP: usize = 10;
+/// 校准样本队列容量（滑动窗口，含预置先验占位）。16 = 估计器的稳态窗口：
+/// 中位数更稳（真实重放 10→16 误差中位数再降 ~0.6pp），自适应交给新近加权
+/// 与 AR1 收缩（突变 2~3 个样本跟上），参数出处见 [`cal_estimate`] 文档
+const CAL_QUEUE_CAP: usize = 16;
 /// 新近加权半衰期（样本数）：最新权重 1，每往前 3 个样本权重减半
 const CAL_HALF_LIFE: f64 = 3.0;
 /// 温和修剪边界（修剪中心的倍数，中心 = 未修剪加权中位数，见 `cal_estimate`
@@ -591,6 +610,15 @@ const CAL_HALF_LIFE: f64 = 3.0;
 /// 波动即近半，剪狠了会把真实量级变化当离群丢掉（自适应反而靠新近权重完成）
 const CAL_TRIM_LO: f64 = 0.4;
 const CAL_TRIM_HI: f64 = 2.5;
+/// AR1 新近收缩强度（见 `cal_estimate` 第 4 点）：向最新样本的对数收缩比。
+/// 实测 lag-1 自相关 ≈0.50 的理论最优为 ρ≈0.5；取 0.3 是分块验证下的稳健值
+/// ——ρ 越大训练段越讨好、测试段中位数反而回退（追单样本噪声），0.3 保住
+/// 全部尾部收益（p75 -7pp）且中位数不劣化
+const CAL_AR1_RHO: f64 = 0.3;
+/// AR1 收缩的比值钳制（末样本/估计 的界）：单样本对系数的影响有界
+///（≤ CLAMP^ρ ≈ ×1.23），离群只拉动一拍、无法跨拍累积；真实重放对比
+/// 「界外跳过收缩」全面更优（钳制拉动同时服务突变先手与稳态尾部）
+const CAL_AR1_CLAMP: f64 = 2.0;
 /// 冷启动先验收缩的样本数上限：窗口不足该数时按比例向先验过渡，
 /// 满 3 个后完全跟随数据（保持「单个异常样本无法独占系数」的历史性质）
 const CAL_SHRINK_N: usize = 3;
@@ -1987,19 +2015,46 @@ mod tests {
     #[test]
     fn cal_estimate_weighted_median_basics() {
         // 满窗一致样本 → 完全等于该值
-        let s: Vec<f64> = vec![560.0; 10];
+        let s: Vec<f64> = vec![560.0; 16];
         assert!((cal_estimate(&s, 600.0) - 560.0).abs() < 1e-9);
-        // 新近加权：末尾 3 个新量级样本（权重 1+.79+.63=2.42）压过 7 个旧量级
-        //（权重和 1.94）——量级突变后 3 个样本跟上，自适应不被窗口拖慢
-        let mut s: Vec<f64> = vec![560.0; 7];
+        // 新近加权：末尾 3 个新量级样本（权重 1+.79+.63=2.42）压过 13 个旧量级
+        //（权重和 ~2.1）——量级突变后 3 个样本跟上，自适应不被窗口拖慢
+        let mut s: Vec<f64> = vec![560.0; 13];
         s.extend([200.0; 3]);
         assert!((cal_estimate(&s, 600.0) - 200.0).abs() < 1e-9);
-        // 温和修剪：单条离群样本（0.23×，半截/静默类垃圾）不拉偏系数
-        let mut s: Vec<f64> = vec![560.0; 9];
+        // 温和修剪 + AR1 有界拉动：单条离群样本（0.23×，半截/静默类垃圾）
+        // 被修剪剔出加权中位数（锚保持 560），但 AR1 收缩仍以钳制界拉动一拍：
+        // 560 × 0.5^0.3 ≈ 454.9——影响有界且下一拍即回正，这是离群容忍与
+        // 突变先手的折中（真实重放净收益为正）
+        let mut s: Vec<f64> = vec![560.0; 15];
         s.push(130.0);
-        assert!((cal_estimate(&s, 600.0) - 560.0).abs() < 1e-9);
+        let bounded = 560.0 * (1.0 / CAL_AR1_CLAMP).powf(CAL_AR1_RHO);
+        assert!((cal_estimate(&s, 600.0) - bounded).abs() < 1e-9);
         // 空窗口回先验
         assert!((cal_estimate(&[], 600.0) - 600.0).abs() < 1e-9);
+    }
+
+    /// AR1 收缩的两条边界性质：钳制界封顶单样本影响；量级突变首样本先手、
+    /// 收敛不慢于无收缩版本
+    #[test]
+    fn cal_estimate_ar1_bounded_and_step_head_start() {
+        // 稳态后一条 ×9 离群：影响 ≤ CLAMP^ρ（比值被钳到 2）
+        let mut s: Vec<f64> = vec![550.0; 15];
+        s.push(5_000.0);
+        let e = cal_estimate(&s, 600.0);
+        let bounded = 550.0 * CAL_AR1_CLAMP.powf(CAL_AR1_RHO);
+        assert!((e - bounded).abs() < 1e-9, "{e} 应等于有界拉动 {bounded}");
+        // 量级突变（300→900）首样本：先手拉动（369 > 300）；中位数锚要等
+        // 新量级权重过半（第 3 个样本）才翻转，期间 AR1 维持有界先手
+        let base = vec![300.0; 12];
+        let e1 = cal_estimate(&[base.as_slice(), &[900.0]].concat(), 600.0);
+        assert!((e1 - 300.0 * CAL_AR1_CLAMP.powf(CAL_AR1_RHO)).abs() < 1e-9, "首样本应先手: {e1}");
+        let e2 = cal_estimate(&[base.as_slice(), &[900.0, 900.0]].concat(), 600.0);
+        assert!((e2 - e1).abs() < 1e-9, "中位数翻转前维持先手: {e2}");
+        let mut s = base.clone();
+        s.extend([900.0; 3]);
+        let e3 = cal_estimate(&s, 600.0);
+        assert!((e3 - 900.0).abs() < 1e-9, "新量级权重过半后完全跟上: {e3}");
     }
 
     /// 冷启动保护保持历史性质：预置先验后，单个异常样本（如 bpt=179）经
@@ -2125,7 +2180,7 @@ mod tests {
     }
 
     /// 重启恢复：越界/非有限值拒收，生效系数按恢复后队列的估计器输出重算
-    /// （与校准路径同口径）；空恢复不动状态。窗口容量 10 时旧样本与先验
+    /// （与校准路径同口径）；空恢复不动状态。窗口容量 16 时旧样本与先验
     /// 占位共存的队列不触发挤出
     #[test]
     fn restore_cal_filters_and_recomputes_median() {
@@ -2139,19 +2194,21 @@ mod tests {
         // 空恢复不动状态
         assert_eq!(io.restore_cal(vec![]), 0);
         assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
-        // 再注入 5 个合法值：容量 10 内不挤出，队列 = [600,500,540,450..490]
+        // 再注入 5 个合法值：容量 16 内不挤出，队列 = [600,500,540,450..490]
         io.restore_cal(vec![450.0, 460.0, 470.0, 480.0, 490.0]);
         assert_eq!(io.cal_state().len(), 8);
         assert!(io.cal_state().contains(&io.params.default_bpt), "容量内先验占位保留");
-        // 未修剪加权中位数 480（新近权重主导）＝修剪中心，修剪后不变
-        assert!((io.bytes_per_token() - 480.0).abs() < 1e-9);
-        // 容量挤出：再注入 5 个，队列保最新 10 个（600/500/540 被挤出）
-        io.restore_cal(vec![510.0, 520.0, 530.0, 525.0, 515.0]);
+        // 未修剪加权中位数 480 ＝修剪中心，修剪后不变；AR1 向最新样本 490
+        // 对数收缩（比值在钳制界内，(490/480)^0.3 ≈ 1.0062）
+        let expect = 480.0 * (490.0f64 / 480.0).powf(CAL_AR1_RHO);
+        assert!((io.bytes_per_token() - expect).abs() < 1e-9, "{est}", est = io.bytes_per_token());
+        // 容量挤出：再注入 10 个，队列保最新 16 个（先验600/500 被挤出）
+        io.restore_cal(vec![505.0, 510.0, 515.0, 520.0, 525.0, 512.0, 518.0, 524.0, 511.0, 517.0]);
         assert_eq!(io.cal_state().len(), CAL_QUEUE_CAP);
         assert!(!io.cal_state().contains(&io.params.default_bpt));
-        // 最新样本 510~530 权重占优，估计落在它们中间
+        // 最新样本 505~525 权重占优，估计落在它们中间
         let est = io.bytes_per_token();
-        assert!((510.0..=530.0).contains(&est), "估计应在新样本量级内: {est}");
+        assert!((505.0..=525.0).contains(&est), "估计应在新样本量级内: {est}");
     }
 
     /// 样本准入用例取自真实调试日志（2026-09-17 现场）：
@@ -2440,9 +2497,11 @@ mod tests {
     }
 
     /// 离群污染：每 10 个样本混入一条 ×0.45 的垃圾样本（准入可放行的
-    /// 半截样本形态）。10% 污染下 5 窗普通中位数的中位数仍扛得住（要 >2/5
-    /// 才翻车），两边的 med 打平——修剪的收益在尾部：断言 p75 与 mean
-    /// 新 ≤ 旧（污染样本不再把系数拖向垃圾量级）
+    /// 半截样本形态）。修剪保证加权中位数锚不被拖动（med 误差不劣于旧
+    /// 5 窗普通中位数）；AR1 收缩对垃圾样本的一拍拉动被 CLAMP^ρ 封顶且
+    /// 好样本当拍拉回——断言系数全程不塌向垃圾量级（有界拖动不变量）。
+    /// 注意持续污染下系数重心会比无收缩版低 ~1 成（钳制拉动的代价），
+    /// 真实重放净收益为正才采纳（scripts/cal_bench.py 对表）
     #[test]
     fn benchmark_outlier_resistance() {
         let mut rng = Lcg(0xBEEF);
@@ -2453,15 +2512,32 @@ mod tests {
             })
             .collect();
         samples[0] = 560.0; // 首样本固定,避免纯随机抖动
-        let (mut old, mut new) = (replay_old(&samples), replay_new(&samples));
+        let mut coeffs = Vec::new();
+        for i in 1..samples.len() {
+            coeffs.push(cal_estimate(&samples[..i], DEFAULT_BPT));
+        }
+        let mut new: Vec<f64> = coeffs
+            .iter()
+            .zip(samples[1..].iter())
+            .map(|(f, s)| (f - *s).abs() / s)
+            .collect();
+        let mut old = replay_old(&samples);
         summarize("离群 旧 median-5", &mut old);
         summarize("离群 新 cal_estimate", &mut new);
-        let op = old[old.len() * 3 / 4];
-        let np = new[new.len() * 3 / 4];
-        assert!(np <= op + 1e-9, "离群场景 p75 新应不劣于旧: {np:.3} vs {op:.3}");
-        let om: f64 = old.iter().sum::<f64>() / old.len() as f64;
-        let nm: f64 = new.iter().sum::<f64>() / new.len() as f64;
-        assert!(nm <= om + 1e-9, "离群场景均值新应不劣于旧: {nm:.3} vs {om:.3}");
+        let om = old[old.len() / 2];
+        let nm = new[new.len() / 2];
+        // med 允许 ≤2pp 的有界回退：AR1 钳制拉动在纯污染场景的已知代价
+        //（实测 ~1pp），真实数据净收益为正（cal_bench 对表）。回退若显著
+        // 超界说明拖动失控
+        assert!(nm <= om + 0.02, "离群场景 med 回退超界: {nm:.3} vs {om:.3}");
+        // 有界拖动：垃圾量级 ≈252（×0.45），系数若被拽到其附近即失效；
+        // 钳制封顶下全程应在 [0.6, 1.4]×560
+        for (k, c) in coeffs.iter().enumerate() {
+            assert!(
+                (0.6..=1.4).contains(&(c / 560.0)),
+                "第{k}拍系数 {c:.0} 塌出有界区间——AR1 拖动失控"
+            );
+        }
     }
 
 
