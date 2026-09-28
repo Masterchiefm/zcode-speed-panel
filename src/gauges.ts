@@ -34,23 +34,6 @@ export function fmtClock(ms: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** 快照记录等粗粒度时刻：今天只显 HH:MM，跨天带月日（MM-DD HH:MM） */
-export function fmtDayClock(ms: number): string {
-  if (!ms) return "--:--";
-  const d = new Date(ms);
-  const now = new Date();
-  const p = (x: number) => x.toString().padStart(2, "0");
-  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return hm;
-  }
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
-}
-
 /** 字节量（网络流量累计）：KB/MB/GB，中文界面沿用国际单位 */
 export function fmtBytes(n: number): string {
   if (!isFinite(n) || n < 0) return "--";

@@ -46,7 +46,7 @@
 
 ## 网速监控（netio.rs）
 
-完整面板「网速监控」卡（默认排在仪表行下方；显隐与顺序可在顶栏 ⚙ 设置中调整，见「模块显隐与排序」节。单行三段横排：速度居左 · 进程连接数居中 · 今日上传/下载最右，窄窗口自动换行；`main` 另有兜底滚动；接口计数不可用的平台整卡隐藏）。监控 ZCode 的上传/下载流量并区分**会话流量**（CLI 进程承载的 API 对话流量）与**非会话上传**（Electron 桌面端的快照上传等），背景是 2026-09-17 的发现：ZCode 会把整个工作区（含完整 `.git/` 历史）打包加密上传到阿里云 OSS（单个工件实测 549MB）。**2026-09-20 起快照相关的一切 UI（防护开关 / 今日快照上传 / 快照上传记录列表）移入下方「快照防护与上传记录」卡**——模块名与内容对应，本卡只留网络流量本身；快照层的取数口径不变（仍由 netio.rs 供数）。
+完整面板「网速监控」卡（默认排在仪表行下方；显隐与顺序可在顶栏 ⚙ 设置中调整，见「模块显隐与排序」节。单行三段横排：速度居左 · 进程连接数居中 · 今日上传/下载最右，窄窗口自动换行；`main` 另有兜底滚动；接口计数不可用的平台整卡隐藏）。监控整机上传/下载流量并区分**会话流量**（CLI 进程承载的 API 对话流量，token 估算）。注：本卡曾带第三层"快照工件真实下界"（轮询 checkpoints 目录）与配套的「快照防护与上传记录」卡，随 ZCode 下线快照功能于 2026-09-28 一并移除（netio 不再扫描 `~/.zcode/v2/checkpoints/`）。
 
 ### 为什么是分层口径（平台限制）
 
@@ -62,7 +62,6 @@
 |---|---|---|
 | 整机上传/下载速度 + 当日总量 | 接口计数器求和（排除回环） | **真实值** |
 | 会话流量（当日上传/下载） | token 数 × 字节系数 | **估算 ≈** |
-| 非会话上传（快照工件） | checkpoints `state.json` 的接受事件 | **真实下界** |
 
 ### 整机实测（真实值）
 
@@ -79,52 +78,14 @@
 - **上传** ≈ 未缓存提示 token × 5 B/token。分子用 `input + cache_creation − cache_read`（**缓存命中的提示部分不重发**——实测 98% 命中下整机当日上传仅数十 KB，按全量重发估算会虚高数十倍）。
 - **下载** ≈ 输出+思考 token × 400 B/token（SSE 事件流密度；2026-09-18 实测标定：流式期整机下载 ÷ token ≈ 731 B/token 为上界、UI 管道系数 bpt≈320 为下界，取居中值）。
 
-### 非会话上传 = 快照工件（真实下界）
-
-轮询 `~/.zcode/v2/checkpoints/*/state.json`（2s 一拍）：
-
-- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。**当日已接受工件带名单**（workspace/字节/记录时刻，封顶 100 条随 `speed-panel-net.json` 持久化、跨重启/回补保留）——状态行「今日 N 个」下方逐行列出工作区名单（按工作区聚合，件数 >1 时附「n 个 · 字节小计」；该工作区最新工件越近排越前——回补扫描顺序不保证按时间，取组内最大 recordedMs 排序；悬停名单行看该工作区今日逐条明细），复制/导出报告同样包含。
-- **上传进行中**：任一 workspace 的 `activeUpload` 非空 → 状态行脉冲提示「快照上传进行中」。
-- **回补**：当日首次启动时，把 recordedAt 在今天、但面板未在场观测到的接受按当前 `lastCompressedSize` 回补计入（面板今天已运行过则只建基线不回补）。
-- **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
-- **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
-- 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
-- **快照上传记录列表**（快照防护与上传记录卡内，2026-09-20 从网络卡右栏移入）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**固定显示 5 行（行高 18px：5×18 + 4×2 间隙 = 98px 限高），其余列表内上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
-- **复制与导出**：列表文字可选中复制（全局 `user-select:none` 的例外区）；列表头有 **复制 / 导出** 按钮——复制把整份纯文本报告（表头 + 逐行记录 + 当日汇总 + ZCode 两组连接实况）写入剪贴板（`navigator.clipboard`，失败退回 `execCommand`），导出走 `export_text_file` 命令写入 `~/.zcode/speed-panel-exports/zcode快照上传记录-日期-时间.txt`（文件名白名单清洗防路径穿越，右下角轻提示完整路径；浏览器预览模式退化为浏览器下载）。
-
 ### ZCode 连接归属（真实值，仅 Windows）
 
 TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按进程分组。**两组都是 ZCode 自身进程的连接，不含其他应用**（界面标签即"ZCode 会话进程 / ZCode 桌面端"，悬停标题有完整说明）：
 
 - **会话组（ZCode 会话进程）**：命令行含 `zcode.cjs` 的 CLI（app-server）进程——对话 API 流量的承载者；进程发现口径与 liveio 一致，5s 刷新一次 pid 分组，连接表每拍枚举；
-- **桌面端组（ZCode 桌面端）**：其余 `zcode.exe` = ZCode 桌面端的 Electron 壳（主/渲染/GPU/工具/崩溃报告进程）——快照上传、遥测等**非对话**流量的承载者。
+- **桌面端组（ZCode 桌面端）**：其余 `zcode.exe` = ZCode 桌面端的 Electron 壳（主/渲染/GPU/工具/崩溃报告进程）——遥测、更新等**非对话**流量的承载者。
 
-每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。**两组连接不显示各自的速度**：按进程网络字节在非管理员下无公开原语（见上"平台限制"，ESTATS 已复验定论），真实速度只有整机层可测。
-
-## 快照防护（snapshot_guard.rs + src/guard.ts）
-
-完整面板的「**快照防护与上传记录**」卡（默认排序在网络监控卡下方；**默认隐藏——在顶栏 ⚙ 设置中勾选后才显示**，见「模块显隐与排序」节）：**阻断 ZCode 工作区快照的静默上传**，同时是快照相关内容在界面上的唯一归处——防护控制区（徽标/按钮/统计，guard.ts 渲染）+ 今日快照上传状态行 + 快照上传记录列表（main.ts 的 `renderSnapshot` 渲染，数据仍来自 netio.rs；2026-09-20 从网络卡并入）。后端无 `guard` 字段（浏览器预览/mock）时防护控制区隐藏、只看记录。
-
-- **机制**：ZCode 登录后会把整个工作区（含 `.git/` 全历史）打成加密 tar.gz 写入 `~/.zcode/v2/checkpoints/<工作区hash>/pending/*.tar.gz.enc`，经 zcode.z.ai 拿凭证直传阿里云 OSS；设置开关无效，凭证 API 与模型 API 同域**不能封网络**（2026-09 本机验证，[机制分析文章](https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/)）。防护 = 目录写入锁——macOS `chflags uchg` 不可变标志（用户级，无需 sudo）/ Windows NTFS 拒绝 ACE（`icacls /deny *<SID>:(OI)(CI)(WD,AD)`，拒绝优先于一切允许：当前用户在树内创建/写入全被拒、读取不受影响）——ZCode 写不进去，快照链路死亡。**不碰网络、不碰进程**，对运行中的 ZCode 无侵入。
-- **两种开启模式**（确认弹窗二选一，2026-09-19）：
-  - **保留并锁定**（推荐）：现有快照**原地保留（加密、只读）**，**递归锁整棵树**（mac `chflags -R uchg`——uchg 只锁目录自身的条目表，只锁根目录挡不住已存在子目录内的写入；win 可继承拒绝 ACE 由系统自动传播到已存在子树，等价递归；key-rules #16）。上传记录照常实时显示、行尾 📂 可打开快照目录；
-  - **删除并锁定**：先留档记录清单再清空全部快照，重建空目录后锁根目录——原始上传记录随之消失（仅剩留档），确认弹窗明示。
-  - 共同代价：损失**「检查点回滚 / 时间线」**（state.json 无法更新）；对话/补全/工具调用不受影响；随时解除（保留模式快照原地恢复可写，删除模式空目录由 ZCode 自动重建）。
-- **卡片口径**：
-  - 状态徽标 🔒 已防护（绿色描边）/ 🔓 未防护，由**写入探测**判定（在目录里 create+delete 临时文件，创建失败 = 已锁；目录不存在 = 未锁）；
-  - 数据行三态：未防护 = `本地已积累加密快照 N 个 · X · 覆盖 M 个项目 · 上传失败 K 次`（N = `**/pending/*.enc` 逐文件实测，K = 各 `state.json` 的 `failureCount` 求和；扫描 5s 节流，**保留模式锁定后只读扫描照常工作**）；防护中·快照已保留 = `防护生效中（快照已保留）：N 个只读锁定（共 X）…`；防护中·快照已删除 = `防护生效中（快照已删除）：目录已清空并锁定…（留档 N 条可回看）`；
-  - 防护中追加 `防护开启后 P 轮对话 · 新快照落盘 0 个`——P 为锁定后的对话轮次：锁定时刻的 `calls_today` 基线存 `~/.zcode/speed-panel-guard.json`，poller 每拍按 calls 增量累计并落盘。**增量基准 `calls_seen` 同样落盘并在启动时恢复**（只存内存时重启归零，首拍把全天计数整包计入——实测 15 分钟虚增至 3412；差分走纯函数 `accrue_rounds`，跨天回退按 0 增量重置基准拍）；目录已锁但 guard.json 无记录（用户手动锁定 / 重装面板）时首拍补记基线。
-- **与上传记录联动**：
-  - "快照上传记录"行尾 **📂 按钮**：在系统文件管理器中打开该工作区的快照目录（`open_checkpoint_dir` 命令，mac `open` / Windows `explorer`，**跨平台**；目录名经 `valid_hash_name` 白名单校验防路径穿越，目录不存在如实报错）。只有磁盘上真实存在的行（实时扫描）才渲染——留档历史行没有 hash 不出按钮；
-  - 防护中：保留模式横幅 `🔒 以下快照已锁定保留（只读）` + 实时行照常显示且可点开；删除模式（扫描为空）= 🔒 锁横幅 + **防护前留档行**（`~/.zcode/speed-panel-ckpt-history.json`，状态「已上传 ✓」整体压暗，旧版本未留档时退回今日名单）；平时列表空 = "暂无快照记录"灰字——列表区任何状态不静默空白；
-  - 今日快照状态行（`ckpt-info`）locked 时今日量行标注「均为防护开启前的记录」（防护生效的宣告在上方防护统计行，不重复 🔒；防护开启后不可能再有"上传中"脉冲）；
-  - 复制/导出报告在防护中（删除模式）追加「防护前原上传记录」节（取证仍完整）。
-- **先留档再清空（删除模式）**：apply 删除 checkpoints 前，把当时的上传记录行（每工作区最近一次快照，复用 netio 的解析与行构建，口径与实时列表一致）合并存入 ckpt-history.json——同工作区新行覆盖旧行、按时刻倒序、上限 500 行（`merge_history` 纯函数，测试守护）；重复开启/解除再开启不丢历史。保留模式不写留档（记录未销毁）。
-- **防护原理与监控边界 hover**：卡片标题悬停展示机制说明（先落盘再上传 → 锁目录 = 断链路）+ 如实声明监控边界（锁状态每拍探测 / 已知机制下 0 新快照为阻断证据 / 整机流量兜底但 mac 无按进程归属，换直传机制只能靠流量异常发现）——不承诺 100% 拦截。
-- **术语**：用户可见文案统一「快照 / 加密快照」，不用内部黑话「工件」（2026-09-18 用户反馈"不要自己取名字"）。
-- **命令**：`snapshot_guard_status` / `snapshot_guard_apply(keepFiles)` / `snapshot_guard_release` / `open_checkpoint_dir(hash)`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply(keep=true) = 整树锁（快照保留）；apply(keep=false) = 留档 → 清空 → 重建 → 锁根目录；release = **整树解锁**（mac 递归 nouchg / win 移除拒绝 ACE 含子树继承副本，兼容保留模式的整树锁）+ 清空计数，**文件一律不动**。**确认弹窗在前端**（`#guard-confirm`）——双模式按钮：「保留快照并锁定」（主按钮）/「删除快照并锁定」（红色 danger 样式）；删除模式的五点知情同意缺一不可：损失检查点回滚 / 对话不受影响 / 原始上传记录随之消失 / 自动备份仅清单（快照文件等明细删后不可恢复）/ 可逆（key-rules #16）。
-- **平台**：macOS / Windows 双平台支持（win 为 NTFS 拒绝 ACE，FAT32/exFAT 无 ACL 时 icacls 如实报错）；其他平台卡片仍显示但按钮禁用、标题右侧标注"文件锁仅支持 macOS / Windows"（沿用连接明细的如实降级先例）。**📂 打开目录是独立命令，两平台均可**（记录列表本身跨平台）。**Windows 与 mac 的锁强度差异**：拒绝 ACE 只拒创建/写入（WD/AD），故意不含删除（D/DC）——实测拒 D 连纯读取都会被以 DELETE 权限打开文件的工具（git-bash 的 POSIX unlink 模拟、部分编辑器/沙箱层）阻断；因此 Windows 下 ZCode 上传成功后的例行清理仍可移走旧的 pending 快照（不产生新泄露），mac 的 uchg 则连删都挡（key-rules #16）。
-- **守护测试**：`state_summary_parse_and_aggregate`（failureCount 求和 / 快照体积累计 / 损坏容错）、`guard_status_serializes_locked_fields`（状态字段 camelCase 序列化契约 + guard.json 往返）、`accrue_rounds_counts_real_delta_only`、`merge_history_replaces_same_workspace_keeps_rest`、`valid_hash_name_rejects_traversal`（路径穿越拒绝）、`parse_whoami_sid_finds_sid_field`（SID 解析）、`windows_icacls_lock_roundtrip`（win 真实 icacls 全生命周期：锁后创建/改写被拒且读取照常、解锁全恢复）。
+每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。**两组连接不显示各自的速度**：按进程网络字节在非管理员下无公开原语（见上"平台限制"，ESTATS 已复验定论），真实速度只有整机层可测。
 
 ## 仪表与曲线（gauges.ts）
 
@@ -147,18 +108,17 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 
 ## 模块显隐与排序（顶栏 ⚙ 设置，main.ts）
 
-完整面板 main 内的四个模块可在设置弹窗里整块开关与排序（顶栏 ⚙ 齿轮按钮，复用通用弹窗头样式 `.model-modal-head`/`.model-modal-title`；齿轮为内联 SVG，同 ⟳ 按钮的理由——符号字形在字体里居中不可靠）：
+完整面板 main 内的三个模块可在设置弹窗里整块开关与排序（顶栏 ⚙ 齿轮按钮，复用通用弹窗头样式 `.model-modal-head`/`.model-modal-title`；齿轮为内联 SVG，同 ⟳ 按钮的理由——符号字形在字体里居中不可靠）：
 
 | 模块（data-module） | 内容 | 默认 |
 |---|---|---|
 | gauges 仪表盘 | 当前速度 / 今日平均 / 今日总量三块仪表；**并发任务卡跟仪表盘走**（出现在其下方，不单列开关/排序） | 显示 |
 | net 网速监控 | 整机上/下行速度 · ZCode 连接归属 · 今日累计 | 显示 |
 | chart 输出速度曲线 | 整体速度曲线（四档时间范围）/ 模型速度趋势，拨杆互斥切换 | 显示 |
-| guard 快照防护与上传记录 | 防护开关 · 今日快照上传 · 上传记录列表 | **隐藏**（快照相关内容显式开启才出现） |
 
 - **交互**：每行 = 自绘勾选框（`.pet-chk` 结构同款，勾选态走本组件的 `.on` 类；禁原生 checkbox——与 key-rules #8 原生 select 同理，浅色弹层不可读）+ 模块名/描述 + ↑↓ 排序按钮（首/末行相应方向禁用）。**隐藏行同样参与排序**——重新勾选时回到原位。另有「恢复默认」一键还原。变更即时生效（弹窗不关闭，遮罩半透明可直接看背后变化）。Esc / 点遮罩空白 / ✕ 关闭；悬浮窗模式下弹窗隐藏（`body.float-mode` 兜底）。
 - **持久化**：localStorage `modules.v1` = `{order, hidden}`（order 为**含隐藏模块**的全局顺序）。读取时清洗：JSON 损坏回默认、未知 id 剔除、缺失模块按默认序补到末尾、去重——手改或旧版本升级不丢模块。
-- **实现口径**：每模块包一层 `.module-wrap[data-module]`，`display: contents` 不参与布局——卡片仍是 `main` 的直接 flex 项，卡片间距（gap 14px）与曲线卡的 `flex:1` 拉伸口径不变；`applyModules()` 按配置把 wrapper 依次 `insertBefore` footer（footer 恒在最后）并设 `hidden`（文件顶部的全局 `[hidden]!important` 兜底）。**全部模块隐藏时显示占位提示**「所有模块都已隐藏 · 点顶栏 ⚙ 重新开启」（不静默空白，同 key-rules #16 精神）。网速/快照卡自身还带数据可用性的 hidden（`renderNet`/`renderSnapshot`），与模块开关相互独立、取交集显示。
+- **实现口径**：每模块包一层 `.module-wrap[data-module]`，`display: contents` 不参与布局——卡片仍是 `main` 的直接 flex 项，卡片间距（gap 14px）与曲线卡的 `flex:1` 拉伸口径不变；`applyModules()` 按配置把 wrapper 依次 `insertBefore` footer（footer 恒在最后）并设 `hidden`（文件顶部的全局 `[hidden]!important` 兜底）。**全部模块隐藏时显示占位提示**「所有模块都已隐藏 · 点顶栏 ⚙ 重新开启」（不静默空白）。网速卡自身还带数据可用性的 hidden（`renderNet`），与模块开关相互独立、取交集显示。
 - 模块开关只影响完整面板；悬浮窗/桌宠/胶囊与状态栏不受影响。
 
 ## 自动启动（autostart.rs）
@@ -207,8 +167,8 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 ## 日志系统（main.rs DebugLog）
 
 - `~/.zcode/speed-panel-debug.jsonl`：JSONL 追加写，8MB 轮转为 `.jsonl.1`；轮转旧文件超 7 天在启动时自动删除。
-- 事件四类：`tick` / `call` / `cal`（格式与排查方法见 [key-rules.md](key-rules.md) #6）与 `cal_reset`（手动/漂移自动重校准：`reason`=manual/auto、系数前后 `bpt_old`/`bpt_new`，auto 另附触发时的轮均值 `round_avg` 与 5 轮基线 `base_avg`）。另有 `net` 事件（netio.rs，见"网速监控"节）：`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，附工作区 `ws`、工件大小 `mb` 与是否回补 `backfill`。
-- `tick` 另含**多任务排查三件套**：`infl`（进行中会话数）、`pids`（每台被跟踪进程的探测窗清洗速率，KB/s）、`attr`（进行中会话尾 4 位 → 归属 pid 列表）。多任务显示异常时先对账这三项：`pids` 里哪台在写、`attr` 是否把两会话挤到同一 pid、`infl` 与门控是否一致（2026-09-18 排查时只有 npids 单字段，无法回答"哪台进程在写"）。`tick` 另含**网络监控五件套**：`net_up`/`net_dn`（整机上传/下载速率，KB/s）、`cli_conn`/`app_conn`（会话组/桌面端组连接数）、`ckpt_up`（快照上传进行中）。
+- 事件四类：`tick` / `call` / `cal`（格式与排查方法见 [key-rules.md](key-rules.md) #6）与 `cal_reset`（手动/漂移自动重校准：`reason`=manual/auto、系数前后 `bpt_old`/`bpt_new`，auto 另附触发时的轮均值 `round_avg` 与 5 轮基线 `base_avg`）。
+- `tick` 另含**多任务排查三件套**：`infl`（进行中会话数）、`pids`（每台被跟踪进程的探测窗清洗速率，KB/s）、`attr`（进行中会话尾 4 位 → 归属 pid 列表）。多任务显示异常时先对账这三项：`pids` 里哪台在写、`attr` 是否把两会话挤到同一 pid、`infl` 与门控是否一致（2026-09-18 排查时只有 npids 单字段，无法回答"哪台进程在写"）。`tick` 另含**网络监控四件套**：`net_up`/`net_dn`（整机上传/下载速率，KB/s）、`cli_conn`/`app_conn`（会话组/桌面端组连接数）。
 
 ## 持久化文件
 
@@ -216,9 +176,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 |---|---|
 | `~/.zcode/speed-panel-mode.txt` | JSON：mode/style/full_pos/float_pos/pet_size（旧格式纯文本兼容） |
 | `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
-| `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down/ckpt/ckpt_count + 当日已接受工件名单 uploads，跨天清零；见"网速监控"节） |
-| `~/.zcode/speed-panel-guard.json` | 快照防护状态（lockedSinceMs/callsBaseline/blockedRounds/callsSeen 增量基准，未防护时不落多余键；见"快照防护"节） |
-| `~/.zcode/speed-panel-ckpt-history.json` | 防护前的原上传记录留档（apply 清空前写入，同工作区新行覆盖，上限 500 行；防护期间列表/报告回看） |
+| `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down，跨天清零；见"网速监控"节） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
 自动启动状态**不落本地文件**——Windows 注册表 `HKCU\…\Run` / macOS LaunchAgent plist 即事实源（见「自动启动」节）。
@@ -246,7 +204,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - 管道静默调用（实测约半数）实时读数走 ≈ 回退，属预期行为而非 bug（此类调用启动期先显示 20s "…" 提示再切换）。
 - 多任务并发（多窗口/子代理并行）时实时读数为**进行中会话归属进程的聚合总吞吐**（任一会话尚无归属记录时触发全进程求和兜底）；完整面板同时显示分任务明细（见"实时速度"节）。同进程内并行的多个子代理在字节层不可拆分，显示为该进程合计。
 - 冷启动后系数需 1~2 个达标调用收敛，此前读数可能有偏差。
-- 网络监控的口径边界（详见"网速监控"节）：**会话流量是 token×系数的量级估算**（± 数倍，带 ≈ 标注）；**快照工件是面板观测期的真实下界**（面板未运行期间的接受仅当日首次启动回补一次）；**整机数字混合其他应用流量**，走本地代理时还含隧道加密开销；连接归属仅 Windows。checkpoints 目录被 ACL 封锁时显示"不可读"，监控不到新上传（封锁本身就是用户侧防护）。
+- 网络监控的口径边界（详见"网速监控"节）：**会话流量是 token×系数的量级估算**（± 数倍，带 ≈ 标注）；**整机数字混合其他应用流量**，走本地代理时还含隧道加密开销；连接归属仅 Windows。曾有的第三层"快照工件真实下界"（checkpoints 接受事件）与快照防护卡已随 ZCode 下线快照功能移除（2026-09-28）。
 - 硬崩溃（CLI 进程被杀、assistant 行无人补写 `completed`）最多残留 10 分钟门控（兜底上限）；已归属会话的进程退出会被进程守卫立即判停，未归属的新会话只能等兜底。
 - mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 700/延迟落盘宽限 15s/离群拒绝 3 倍）中，先验与宽限已按 2026-09-17 的 6 条 cal 事件真值对账修正（归因正确时 pred/true 完全一致 62.1=62.1），尚未做 Windows 侧同等长度的对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账、看 cal 事件 `attr_pid`/`top_pid` 归因再调参（key-rules #10）。
 - 应用内更新能力**随版本生效**：只有装了含 updater.rs 版本的用户才会收到后续更新提示，存量旧版本需手动升级一次铺底；dev 实例（`npm run tauri dev`）同样做真实检查与下载——版本等于最新 Release tag 时显示"已是最新"，属预期（热重启每次都会触发一次启动检查，量级远低于 API 限流）。

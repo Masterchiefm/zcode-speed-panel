@@ -109,32 +109,18 @@
 
 ## 15. 网络字节的平台原语限制：按进程直测无公开原语，口径必须分层
 
-背景：2026-09-17 发现 ZCode 静默上传整仓快照（含 `.git/` 历史，单工件 549MB）到阿里云 OSS，需要流量监控区分会话/非会话上传。2026-09-18 本机实验定论（netio.rs 分层口径的依据）：
+背景：netio 最初为区分 ZCode 会话/非会话上传而建（2026-09-17 曾发现 ZCode 静默上传整仓快照到阿里云 OSS；该功能后被 ZCode 下线，netio 的快照工件监测层与快照防护卡已于 2026-09-28 一并移除，但本条平台原语结论仍然成立并约束 netio/liveio 的任何新口径）：
 
 - **Winsock 收发字节不进进程 IO 计数器的任何一项**：curl 下载 20MB 期间 `ReadTransferCount` 仅 7.8KB（`Write` 12MB 全是往 NUL 设备的落盘镜像，`Other` 82KB 是杂项 IOCTL）。=> ① liveio 的 `WriteTransferCount` 流式测速**天然不受网络污染**，勿往里加网络语义；② 想从 IO 计数器反推网络字节是死路。旧文档把"调用开始瞬间 >100KB 写突发"解释为"请求体上传"是误判——实为提示文本写 message 行/rollout 的落盘。
-- **TCP ESTATS 已坏（2026-09-18 二次复验归档 `scripts/estats_probe.py`，勿再空手重试）**：`SetPerTcpConnectionEStats`/`GetPerTcpConnectionEStats`（注意**导出名是 EStats 大写 S**，与 MSDN 文档名 Estat 不同，直接 `#[link]` 会 LNK2019，须 LoadLibrary+GetProcAddress）。首验（代码未留档）：所有连接含本进程自有的返回 `ERROR_NOT_SUPPORTED`(50)，管理员也一样。复验（build 26200、普通权限）：v4/v6 共 4 个导出符号全部存在；`Set`（启用 Data 采集）对**自有与他人进程的连接一律 `ERROR_ACCESS_DENIED`(5)**——启用采集是特权操作、与连接归属无关；未启用时 `Get` 恒失败（`ERROR_INVALID_USER_BUFFER`(1784) 居多、个别连接 50），换调用姿势（Get 附 Rw 缓冲 / Set 附 Rod 缓冲）不改变结果。=> 唯一的每连接字节数公开 API 在普通权限下不可用（面板不以管理员为前提），**按进程真实网络速度因此不可实现**，只能走估算口径（整机真值 + 会话 token 估算 + 工件下界三层）。
+- **TCP ESTATS 已坏（2026-09-18 二次复验归档 `scripts/estats_probe.py`，勿再空手重试）**：`SetPerTcpConnectionEStats`/`GetPerTcpConnectionEStats`（注意**导出名是 EStats 大写 S**，与 MSDN 文档名 Estat 不同，直接 `#[link]` 会 LNK2019，须 LoadLibrary+GetProcAddress）。首验（代码未留档）：所有连接含本进程自有的返回 `ERROR_NOT_SUPPORTED`(50)，管理员也一样。复验（build 26200、普通权限）：v4/v6 共 4 个导出符号全部存在；`Set`（启用 Data 采集）对**自有与他人进程的连接一律 `ERROR_ACCESS_DENIED`(5)**——启用采集是特权操作、与连接归属无关；未启用时 `Get` 恒失败（`ERROR_INVALID_USER_BUFFER`(1784) 居多、个别连接 50），换调用姿势（Get 附 Rw 缓冲 / Set 附 Rod 缓冲）不改变结果。=> 唯一的每连接字节数公开 API 在普通权限下不可用（面板不以管理员为前提），**按进程真实网络速度因此不可实现**，只能走估算口径（整机真值 + 会话 token 估算两层）。
 - **ETW 内核网络事件需要管理员**，桌面工具不可依赖。
 - **Windows 接口计数器（`GetIfTable` 的 dwIn/dwOutOctets）是 32 位**：必须**逐接口**模 2³² 差分——各接口回绕时机不同，先求和再差分在任一接口回绕后即错（初版实现就是这个 bug，靠测试抓住）。mac `getifaddrs` 的 ifi_*bytes 为 64 位，但**每接口按地址族返回多行，必须按接口名去重**否则字节翻倍。
 - **缓存命中的提示不重发**：98% 命中下整机当日上传仅数十 KB——会话上传估算的分子必须用 `input − cache_read`（未缓存部分），按全量重发估算会虚高数十倍。会话下载密度实测 ~731 B/token（整机含杂流上界）/ UI 管道 bpt≈320（下界），估算系数取 400。
-- **"与任务管理器对不上"是口径差异，不是计数 bug**（2026-09-18 用户报告过一次）：① 单位——任务管理器为比特（Mbps/Kbps），面板为字节，×8 才可比；② 范围——任务管理器 Wi-Fi 页仅所选适配器，面板为全部非回环接口求和（虚拟网卡/VPN 隧道流量内外层各计一次）；③ 时间——面板 ~1s 滑窗平均（`NET_WINDOW_MS`，对齐任务管理器刷新节奏），突发被摊平且采样时刻不同。另：整机当日累计只含面板在场时段（重启基线重打、无回补），与按接受事件回补的快照工件口径独立，"工件 GB 级、整机 MB 级"可同时为真。
+- **"与任务管理器对不上"是口径差异，不是计数 bug**（2026-09-18 用户报告过一次）：① 单位——任务管理器为比特（Mbps/Kbps），面板为字节，×8 才可比；② 范围——任务管理器 Wi-Fi 页仅所选适配器，面板为全部非回环接口求和（虚拟网卡/VPN 隧道流量内外层各计一次）；③ 时间——面板 ~1s 滑窗平均（`NET_WINDOW_MS`，对齐任务管理器刷新节奏），突发被摊平且采样时刻不同。整机当日累计只含面板在场时段（重启基线重打）。
 
-=> 现行方案（netio.rs）：整机接口计数（真实）+ 会话 token 估算（≈）+ checkpoints `state.json` 工件接受事件（真实下界）三层分层，UI 逐项标注口径；连接归属用 `GetExtendedTcpTable`(OWNER_PID) 按进程分组（命令行含 `zcode.cjs` = 会话组，其余 `zcode.exe` = 桌面端非会话组）。**证据链**：整机上传飙升 + 桌面端组新连接 + `activeUpload` = 快照上传现场。守护测试：`wrap_delta_handles_32bit_wrap_and_resets`（回绕/重置钳 0）、`apply_ckpt_obs_counts_acceptance_diffs`（接受差分/跨天去重/回补）、`parse_ckpt_state_fields`。
+=> 现行方案（netio.rs）：整机接口计数（真实）+ 会话 token 估算（≈）两层分层，UI 逐项标注口径；连接归属用 `GetExtendedTcpTable`(OWNER_PID) 按进程分组（命令行含 `zcode.cjs` = 会话组，其余 `zcode.exe` = 桌面端非会话组）。守护测试：`wrap_delta_handles_32bit_wrap_and_resets`（回绕/重置钳 0）、`sess_est_scales_with_tokens`（估算系数契约）。
 
-## 16. 快照防护：锁定/删除是破坏性动作，知情同意弹窗不可绕过
-
-「开启防护」（snapshot_guard.rs 的 apply）会锁定 `~/.zcode/v2/checkpoints/`（macOS `chflags uchg` / Windows NTFS 拒绝 ACE），**删除模式还会删除本地全部快照**。用户明确要求的知情同意（改弹窗时缺一不可）：**删除模式五点**——明示损失「检查点回滚 / 时间线」、明示"模型对话/补全/工具调用不受任何影响"、明示删除的快照数量与体积且**原始上传记录会随之消失**、明示**会自动备份上传记录清单但只备份清单**（快照文件等明细不备份、删后不可恢复）、明示可逆；**保留模式**（2026-09-19 新增，弹窗双按钮二选一）——快照原地只读保留、记录可看可点开，不涉"记录消失"，但须明示占用磁盘与只读。后端 apply/release 收到调用即执行、不做二次确认（防弹窗被绕过后语义分裂）；「解除防护」同样过确认弹窗（简短版）。
-- **递归锁机制坑（保留模式的命门，2026-09-19）**：`chflags uchg` 只锁**目录自身的条目表**——已存在的子目录（`checkpoints/<hash>/pending/`）内部仍可写，**只锁根目录挡不住已有工作区写新快照**。保留模式必须 `chflags -R uchg` 递归锁整树；release 必须配套 `-R nouchg`（只解根目录会留下锁死的子树，恢复后 ZCode 写入仍失败且用户看不出原因）。锁定只挡写不挡读——只读扫描（记录列表/统计）在锁定期间照常工作。
-- **Windows 实现（2026-09-20 本机实证，三坑）**：NTFS 无用户级不可变标志，等价物是**拒绝 ACE**（`icacls /deny *<SID>:(OI)(CI)(WD,AD)`，拒绝优先于一切允许）。三个坑：① **必须用 SID 不能用用户名**——Microsoft 账户登录时 `%USERNAME%`（如 moqiq）与 ACL 主体名（`MicrosoftAccount\email`）不一致，按名 deny 匹配不上；SID 取 `whoami /user /fo csv /nh` 的 S-1- 字段（`parse_whoami_sid` 纯函数解析）。② **拒绝 ACE 故意不含 D/DC（删除）**——实测拒 D 后连纯读取都被拒：以 DELETE 权限打开文件的工具（git-bash 的 POSIX unlink 语义模拟、部分沙箱/备份层）整体失败，连带面板只读扫描不可用；只拒 WD/AD（创建/写入）已让新快照完全写不进来，代价是 ZCode 上传后的例行清理仍可移走旧 pending 文件（不产生新泄露，mac uchg 则连删都挡——平台差异如实写进 features.md）。③ **可继承 ACE 自动传播 = 递归等价**：`(OI)(CI)` 由系统传播到已存在子树（等价 mac `-R`），无需逐个加锁；解除 `/remove:d` 只动根、子树继承副本随自动继承清除。FAT32/exFAT 无 ACL，icacls 如实报错（不假装成功）。守护测试 `windows_icacls_lock_roundtrip`（真实 icacls 全生命周期）+ `parse_whoami_sid_finds_sid_field`。
-- **不能封网络**：快照上传凭证 API 与模型 API 同域，网络层拦截会打断对话；唯一安全解是文件系统目录写入锁（目录写不进 → 快照链路死亡），见 features.md「快照防护」。
-- **锁定判定与幂等**：apply 必须先整树解锁再清空重建（重复开启/目录已锁时直接 remove 会失败）；锁定后用写入探测（create+delete 临时文件失败 = 已锁）校验生效并作为每拍的状态来源——guard.json 只是计数（锁定时刻 + calls 基线 + 累计轮次 + calls_seen 基准），**目录实际状态以探测为准**（外部解锁时 poller 清档如实反映）。
-- **增量计数基准必须落盘（2026-09-18 事故：15 分钟虚增 3412 轮）**：blocked_rounds 按 calls_today 差分累计，但基准只存在内存（`last_calls`）时**重启即归零**，首拍把全天计数整包计入——每重启一次虚增一次。修法：基准 `calls_seen` 持久化进 guard.json，`new()` 恢复，差分走纯函数 `accrue_rounds`（测试 `accrue_rounds_counts_real_delta_only` 守护"重启只算真实增量"）。任何"差分累计"类计数同理：**跨重启的基准要么落盘、要么重扫全量对齐，不能悬在内存里**。
-- **防护与上传记录必须联动（同日二次事故）**：apply 清空 checkpoints 后磁盘扫描必为空——上传记录列表若按"空就整块隐藏"处理，当时的网络卡右栏变 70% 空白（用户以为坏了）。修法：**apply 先留档再清空**（记录行存 `speed-panel-ckpt-history.json`，同工作区新行覆盖、`merge_history` 测试守护），防护中列表回放留档（状态「防护前」）、复制/导出报告含历史节；列表为空给占位，今日快照状态行 locked 时标注"均为防护开启前的记录"（2026-09-20 起记录列表与状态行都在快照防护卡内，layout 无关因果）。**"数据源被自己删掉"的 UI 必须先留档、再显式表达因果，不能静默空白**。
-- **UI 文案不许造词（同日用户反馈："不要自己取名字，工件是啥"）**：用户可见文案用平实词（快照/加密快照/项目），内部术语（工件/workspace）只留在代码注释与文档口径里。
-- **确认弹窗文案排版禁用 flex（同日"乱码"事故）**：要点行内嵌 `<b>` 加粗段时，`p{display:flex}` 会把 span/b 拆成不换行的独立子项，长句互相挤压错位、看似乱码。弹窗/文案段落一律块级文本流（bullet 用 `::before` 绝对定位 + padding-left）。
-- **平台如实降级**：目录写入锁支持 macOS（chflags）与 Windows（拒绝 ACE），其他平台卡片显示但按钮禁用 + "文件锁仅支持 macOS / Windows"（沿用 netio"连接明细仅 Windows"先例，不假装支持）。
-- 守护测试：`state_summary_parse_and_aggregate`、`guard_status_serializes_locked_fields`（含 guard.json 往返与"未防护不落多余键"）、`accrue_rounds_counts_real_delta_only`、`windows_icacls_lock_roundtrip`（win 真实 icacls）、`parse_whoami_sid_finds_sid_field`。
-
-## 17. mac 窗口全屏/Dock：只信官方身份与默认行为，别跟 AppKit 抠细节（2026-09-19 全屏攻坚定论）
+## 16. mac 窗口全屏/Dock：只信官方身份与默认行为，别跟 AppKit 抠细节（2026-09-19 全屏攻坚定论）
 
 用户要求 mac 绿色交通灯为原生全屏。攻坚过程与教训（一天内多轮实测）：
 

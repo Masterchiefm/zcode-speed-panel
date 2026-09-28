@@ -4,7 +4,6 @@ mod autostart;
 mod liveio;
 mod metrics;
 mod netio;
-mod snapshot_guard;
 mod updater;
 
 use liveio::{LiveIo, RoundDrift};
@@ -89,11 +88,8 @@ struct AppState {
     mode: Mutex<Mode>,
     style: Mutex<FloatStyle>,
     live: Mutex<LiveIo>,
-    /// 网络流量监控（netio.rs：整机接口计数 + 连接归属 + 快照上传证据）
+    /// 网络流量监控（netio.rs：整机接口计数 + 连接归属）
     net: Mutex<netio::NetIo>,
-    /// 快照防护（snapshot_guard.rs：目录写入锁 mac chflags / win icacls 拒绝
-    /// ACE，随 poller 每拍更新）
-    guard: Mutex<snapshot_guard::SnapshotGuard>,
     debug: Mutex<DebugLog>,
     persist: Mutex<Persisted>,
     /// 位置落盘节流（拖动期间每 2s 一次，关闭/退出立即落盘）
@@ -210,7 +206,7 @@ impl DebugLog {
 }
 
 /// 完整面板默认尺寸（逻辑像素）：高度 800 让打开时全部卡片（含底部曲线卡）
-/// 免滚动全见（内容自然高 ~760；快照记录列表固定 5 行后网络卡 ~220）
+/// 免滚动全见（内容自然高 ~760）
 const FULL_SIZE: (f64, f64) = (1000.0, 800.0);
 /// 仪表悬浮窗 148×118：高 118 让主环弧底距窗口下边 8px，与右上角"上轮"小环
 /// 的 top:8px 对称（主环画布 116px 宽，半径由画布推出、弧底在 gauges.ts
@@ -460,8 +456,6 @@ struct SnapshotPayload {
     rollout_dir: String,
     mode: String,
     float_style: String,
-    /// 快照防护状态（每拍附带，前端卡片渲染）
-    guard: snapshot_guard::SnapshotGuardStatus,
 }
 
 fn build_payload(app: &AppHandle) -> SnapshotPayload {
@@ -484,20 +478,15 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     // 实时实测：进程 IO 写字节流（真实值）。多任务并发（多窗口/子代理）时
     // 按进行中会话的归属进程并集聚合，当前速度 = 真实总吞吐
     let now_ms = snapshot.now_ms;
-    // 快照防护（snapshot_guard.rs）：锁定探测 + blocked_rounds 增量累计 +
-    // 节流扫描，随 payload 推送前端卡片
-    let guard_status = state.guard.lock().unwrap().tick(snapshot.calls_today, now_ms);
-    // 网络流量监控：整机接口计数差分 + 连接归属 + checkpoint 工件证据
+    // 网络流量监控：整机接口计数差分 + 连接归属
     let net_now = state.net.lock().unwrap().tick(now_ms);
-    let net_log_events: Vec<serde_json::Value> = state.net.lock().unwrap().take_events().into_iter().collect();
     snapshot.net_available = net_now.available;
     snapshot.net_up_bps = net_now.up_bps;
     snapshot.net_down_bps = net_now.down_bps;
     snapshot.net_up_today = net_now.up_today;
     snapshot.net_down_today = net_now.down_today;
     // 会话流量估算（≈）：上传分子用未缓存提示（缓存命中不重发，实测整机
-    // 当日上传仅数十 KB），下载按输出 token × SSE 密度系数；非会话上传的
-    // 真实下界来自 checkpoint 工件
+    // 当日上传仅数十 KB），下载按输出 token × SSE 密度系数
     let uncached_prompt = snapshot
         .input_tokens
         .saturating_add(snapshot.cache_creation_tokens)
@@ -508,12 +497,6 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     );
     snapshot.net_sess_up_today = sess_up;
     snapshot.net_sess_down_today = sess_down;
-    snapshot.net_ckpt_today = net_now.ckpt_today_bytes;
-    snapshot.net_ckpt_today_count = net_now.ckpt_today_count;
-    snapshot.net_ckpt_today_list = net_now.ckpt_today_list.clone();
-    snapshot.net_ckpt_uploading = net_now.ckpt_uploading;
-    snapshot.net_ckpt_status = net_now.ckpt_status.clone();
-    snapshot.net_ckpt_list = net_now.ckpt_list.clone();
     snapshot.net_conns_available = net_now.conns_available;
     snapshot.net_cli_conns = net_now.cli_conns;
     snapshot.net_app_conns = net_now.app_conns;
@@ -625,9 +608,6 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     {
         let state = app.state::<AppState>();
         let mut log = state.debug.lock().unwrap();
-        for ev in &net_log_events {
-            log.write(ev.clone());
-        }
         for c in &new_calls {
             log.write(serde_json::json!({
                 "kind": "call",
@@ -709,7 +689,6 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "net_dn": (net_now.down_bps / 1024.0 * 10.0).round() / 10.0,
                 "cli_conn": net_now.cli_conns,
                 "app_conn": net_now.app_conns,
-                "ckpt_up": net_now.ckpt_uploading,
             }));
         }
     }
@@ -771,86 +750,12 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         snapshot,
         mode: mode.as_str().to_string(),
         float_style: style.as_str().to_string(),
-        guard: guard_status,
     }
 }
 
 #[tauri::command]
 fn snapshot(app: AppHandle) -> SnapshotPayload {
     build_payload(&app)
-}
-
-/// 当前 epoch ms（快照防护锁定时刻记录用）
-fn epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-// ---- 快照防护（snapshot_guard.rs）：状态随 metrics payload 每拍附带，
-//      此处三个命令供前端卡片手动查询 / 开启 / 解除（开启与解除的知情
-//      同意确认弹窗在前端 #guard-confirm，见 key-rules #16）----
-
-#[tauri::command]
-fn snapshot_guard_status(app: AppHandle) -> snapshot_guard::SnapshotGuardStatus {
-    let state = app.state::<AppState>();
-    let mut guard = state.guard.lock().unwrap();
-    let calls = guard.last_calls_seen();
-    guard.tick(calls, epoch_ms())
-}
-
-/// 开启防护（前端已过确认弹窗，keep_files = 保留现有快照递归锁 / 删除后锁空目录）
-#[tauri::command]
-fn snapshot_guard_apply(
-    app: AppHandle,
-    keep_files: Option<bool>,
-) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
-    let state = app.state::<AppState>();
-    // 锁定时刻的 calls_today 基线取实时真值（Engine 只读聚合，一次性开销可接受）
-    let calls = state.engine.lock().unwrap().snapshot().calls_today;
-    let result = state
-        .guard
-        .lock()
-        .unwrap()
-        .apply(calls, epoch_ms(), keep_files.unwrap_or(false));
-    result
-}
-
-/// 解除防护：递归解锁（文件不动——删除模式目录本就为空，保留模式快照原地恢复可写）
-#[tauri::command]
-fn snapshot_guard_release(app: AppHandle) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
-    let state = app.state::<AppState>();
-    let calls = state.engine.lock().unwrap().snapshot().calls_today;
-    let result = state.guard.lock().unwrap().release(calls);
-    result
-}
-
-/// 在系统文件管理器中打开某工作区的快照目录（上传记录行的 📂，跨平台：
-/// mac Finder / Windows 资源管理器）。hash 为 checkpoints 下子目录名，
-/// 白名单校验防路径穿越；目录不存在（快照已删除/未生成）如实报错
-#[tauri::command]
-fn open_checkpoint_dir(hash: String) -> Result<(), String> {
-    if !snapshot_guard::valid_hash_name(&hash) {
-        return Err("非法的工作区目录名".into());
-    }
-    let dir = snapshot_guard::checkpoints_dir()
-        .ok_or("无法定位用户目录")?
-        .join(&hash);
-    if !dir.is_dir() {
-        return Err("该工作区的快照目录不存在（快照可能已被删除或尚未生成）".into());
-    }
-    #[cfg(target_os = "macos")]
-    let st = std::process::Command::new("open").arg(&dir).spawn();
-    #[cfg(target_os = "windows")]
-    let st = std::process::Command::new("explorer").arg(&dir).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = &dir;
-        return Err("仅支持 macOS / Windows".into());
-    }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    st.map(|_| ()).map_err(|e| format!("打开目录失败: {e}"))
 }
 
 /// 模型速度趋势：只读查询 usage 库按模型 × 桶聚合（详情弹窗打开期间前端每 5s 拉取）。
@@ -1329,32 +1234,6 @@ fn autostart_set(mode: String) -> Result<String, String> {
     Ok(autostart::current_mode().as_str().to_string())
 }
 
-/// 导出文本文件（快照上传记录等前端生成的报告）：写入
-/// `~/.zcode/speed-panel-exports/<file_name>`，返回完整路径供前端提示。
-/// 文件名做白名单清洗（只留字母数字._-，防路径注入/穿越）
-#[tauri::command]
-fn export_text_file(file_name: String, text: String) -> Result<String, String> {
-    const MAX_TEXT: usize = 4 * 1024 * 1024;
-    if text.len() > MAX_TEXT {
-        return Err("内容过大".into());
-    }
-    let cleaned: String = file_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
-        .collect();
-    if cleaned.is_empty() || cleaned.starts_with('.') {
-        return Err("文件名无效".into());
-    }
-    let Some(home) = home_dir() else {
-        return Err("无法定位用户目录".into());
-    };
-    let dir = home.join(".zcode").join("speed-panel-exports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
-    let path = dir.join(cleaned);
-    std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
 /// 用系统默认浏览器打开链接（更新说明页）。WebView 内 <a> 导航行为不可控，
 /// 统一由后端代开；仅接受 https，防前端注入 file:// 一类协议
 #[tauri::command]
@@ -1524,7 +1403,6 @@ fn main() {
             style: Mutex::new(FloatStyle::Gauge),
             live: Mutex::new(LiveIo::new()),
             net: Mutex::new(netio::NetIo::new()),
-            guard: Mutex::new(snapshot_guard::SnapshotGuard::new()),
             debug: Mutex::new(DebugLog::new()),
             persist: Mutex::new(Persisted::default()),
             last_pos_save: Mutex::new(None),
@@ -1554,14 +1432,9 @@ fn main() {
             check_update,
             install_update,
             app_version,
-            export_text_file,
             open_url,
             autostart_get,
-            autostart_set,
-            snapshot_guard_status,
-            snapshot_guard_apply,
-            snapshot_guard_release,
-            open_checkpoint_dir
+            autostart_set
         ])
         .setup(|app| {
             // mac 激活策略**动态切换**（apply_mode 按模式设置，不再固定）：

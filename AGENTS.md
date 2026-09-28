@@ -1,13 +1,13 @@
 # AGENTS.md
 
-ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows / macOS 双平台），实时实测 ZCode CLI 的流式输出速度并统计今日 token 用量，附带网速监控（整机实测 + 会话估算拆分）与「快照防护与上传记录」卡（快照相关 UI 的唯一归处：防护开关 mac chflags / win ACL 拒绝 ACE 阻断工作区快照静默上传 + 今日快照上传 + 上传记录列表）。前端为无框架 TypeScript + Canvas（Vite），后端 Rust 通过 `~/.zcode/cli/db/db.sqlite`（只读）、进程 IO 计数、网络接口计数与 `~/.zcode/v2/checkpoints/` 状态文件取数。
+ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows / macOS 双平台），实时实测 ZCode CLI 的流式输出速度并统计今日 token 用量，附带网速监控（整机实测 + 会话流量估算拆分）。前端为无框架 TypeScript + Canvas（Vite），后端 Rust 通过 `~/.zcode/cli/db/db.sqlite`（只读）、进程 IO 计数与网络接口计数取数。
 
 ## 命令
 
 ```bash
 npx tsc --noEmit                    # 前端类型检查（改 src/*.ts 后必跑）
 npm run build                       # tsc + vite build
-cd src-tauri && cargo test          # Rust 单元测试（58 个，含合成端到端、系数估计器基准 benchmark_*、更新/网络监控/快照防护纯函数）
+cd src-tauri && cargo test          # Rust 单元测试（48 个，含合成端到端、系数估计器基准 benchmark_*、更新/网络监控纯函数）
 cd src-tauri && cargo check         # 后端编译检查
 npm run tauri dev                   # 开发运行（用户常驻一个 dev 实例，改码会热重启它）
 npm run tauri build                 # 正式版（Windows NSIS / macOS dmg，按宿主平台）
@@ -33,24 +33,23 @@ python scripts/estats_probe.py      # 复验 TCP ESTATS 每连接字节可用性
 ```
 src-tauri/src/metrics.rs   数据层：usage 库轮询 + 当日聚合（Engine/Aggregator，纯函数可测）
 src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windows 进程句柄 IO / macOS libproc+rusage）+ 平台参数化清洗（CleanParams）/积分/真值校准（一致性校准样本 → cal_estimate 新近加权中位数 + AR1 收缩估计器，精度基准 scripts/cal_bench.py + 测试 benchmark_*）+ 多任务进程集合聚合（pick_pid_set/merge_streams，归属迟滞/跨进程样本守卫）+ 轮均速漂移自动重校准（RoundDrift）
-src-tauri/src/netio.rs     网速监控：整机接口计数（win GetIfTable 32 位逐接口模差 / mac getifaddrs 去重）+ 会话/非会话上传拆分（token 估算 ≈ + checkpoints 工件真实下界）+ TCP 连接按进程分组（仅 win）+ 当日累计持久化
-src-tauri/src/snapshot_guard.rs  快照防护：锁定 ~/.zcode/v2/checkpoints 阻断工作区快照静默上传（mac chflags uchg / win icacls 拒绝 ACE·SID 必须 whoami 取·故意不拒删——拒 D 连读都会被以 DELETE 打开的工具阻断；写入探测定状态、calls 增量计轮次、guard.json 持久化；双平台）
+src-tauri/src/netio.rs     网速监控：整机接口计数（win GetIfTable 32 位逐接口模差 / mac getifaddrs 去重）+ 会话流量估算拆分（token 估算 ≈）+ TCP 连接按进程分组（仅 win）+ 当日累计持久化（快照工件监测层与快照防护卡已随 ZCode 下线快照功能移除，2026-09-28）
 src-tauri/src/updater.rs   应用内更新：GitHub Releases 检查/下载/安装（纯函数 parse_version/is_newer/pick_asset 可测；产物命名耦合见 key-rules #12）
 src-tauri/src/autostart.rs 自动启动：设置弹窗三态（关闭 / 开机自启 boot / 跟随 ZCode follow）；注册表 HKCU Run（winreg，仅 win 目标）/ LaunchAgent plist（mac 手写 XML）即唯一事实源、不落本地配置；follow 靠 `--zcode-follow` 启动参数静默待命 + 2s 轮询 `any_zcode_process`（liveio platform）唤醒（mac 分支未实机验证）
 src-tauri/src/main.rs      应用层：轮询线程、更新检查线程、窗口模式/位置持久化、托盘（mac 菜单栏 + 动态 Dock 两态：完整面板 Regular/悬浮窗 Accessory）、DebugLog
 src-tauri/examples/        dump/verify 调试工具（#[path] include src，改公开 API 须同步）
 src-tauri/capabilities/    Tauri 前端权限白名单（窗口 API 必须在此放行）
-src/                       前端：main.ts 装配 + 模块显隐设置（顶栏 ⚙，localStorage modules.v1）+ 设置弹窗「自动启动」区（autostart_get/autostart_set）+ 快照卡记录区 renderSnapshot / gauges.ts 绘制 / model_stats.ts 曲线卡「模型详情」视图（拨杆与整体曲线互斥切换，图例 chips 多选）/ guard.ts 快照卡防护控制区 / pet.ts 桌宠 / mock.ts 预览
+src/                       前端：main.ts 装配 + 模块显隐设置（顶栏 ⚙，localStorage modules.v1）+ 设置弹窗「自动启动」区（autostart_get/autostart_set）+ gauges.ts 绘制 / model_stats.ts 曲线卡「模型详情」视图（拨杆与整体曲线互斥切换，图例 chips 多选）/ pet.ts 桌宠 / mock.ts 预览
 public/pets/               宠物包资源；scripts/*.py 调试日志分析；.github/workflows/ CI
 ```
 
-数据流：poller 线程每 ~700ms 一拍 → `Engine.poll`（SQLite 增量摄取）→ `Engine.snapshot`（当日聚合 + 90 桶曲线）→ `LiveIo.measure`（进程集合清洗/门控/一致性校准 → 覆写实时值；多任务并发时聚合总吞吐 + 分任务明细）→ `NetIo.tick`（整机接口差分 + 连接归属 + checkpoints 工件事件 → 网络卡字段、会话流量估算与快照卡记录数据）→ `SnapshotGuard.tick`（快照防护锁定探测 + 轮次累计 → guard 字段）→ 托盘状态项更新 → DebugLog（JSONL）→ `emit("metrics")` → 前端渲染。
+数据流：poller 线程每 ~700ms 一拍 → `Engine.poll`（SQLite 增量摄取）→ `Engine.snapshot`（当日聚合 + 90 桶曲线）→ `LiveIo.measure`（进程集合清洗/门控/一致性校准 → 覆写实时值；多任务并发时聚合总吞吐 + 分任务明细）→ `NetIo.tick`（整机接口差分 + 连接归属 → 网络卡字段与会话流量估算）→ 托盘状态项更新 → DebugLog（JSONL）→ `emit("metrics")` → 前端渲染。
 
 启动路径（与上面这条轮询链并列）：`--zcode-follow`（autostart.rs follow 模式）时 setup 跳过 `window.show()` 静默待命（只留托盘），检测线程每 2s 查 `any_zcode_process()`、命中即 `show_main` 亮出面板；无参数则照常 `window.show()`。
 
 ## 规则与踩坑（全在 docs，AGENTS 不留副本）
 
-全部关键规则与踩坑案例集中在 **[docs/key-rules.md](docs/key-rules.md)**，改代码前必读。速览：`$()` 启动崩溃、Tauri 权限白名单、一致性校准口径、负拍对消、校准样本准入、调试日志排查法、examples 编译耦合、原生 select 弹层不可读、启停门控用 message 行 completed 字段（禁用 model_usage 完成行）、mac 平台差异（burst 即信号/files 扣除反噬/进程识别口径/FFI 偏移断言/退出兜底/延迟落盘宽限）、SQLite WAL 锁与长期运行防抖（busy_timeout/query_only/扫描 buffer 复用/session_pid 淘汰）、更新功能与 CI 产物命名/版本号三处同步的耦合、多任务并发实时链路（门控全量会话/进程集合聚合/归属迟滞+并发去重——同一 ZCode 窗口新开任务复用同一 app-server 进程、跨项目才分进程/求和口径——文件增量只扣一次、时长只计一次）、网络字节平台原语限制（socket 不进进程 IO 计数/ESTATS 已坏/32 位接口计数逐接口模差/缓存命中不重发——按进程直测无公开原语，netio 分层口径）、窗口控制平台原生化与多屏安全最大化、快照防护知情同意（锁定/删除是破坏性动作必须先过确认弹窗、明示损失检查点回滚——不能封网络，唯一解是目录写入锁：mac chflags / win 拒绝 ACE 故意不拒删）——共 16 条，每条含事故案例与守护措施。
+全部关键规则与踩坑案例集中在 **[docs/key-rules.md](docs/key-rules.md)**，改代码前必读。速览：`$()` 启动崩溃、Tauri 权限白名单、一致性校准口径、负拍对消、校准样本准入、调试日志排查法、examples 编译耦合、原生 select 弹层不可读、启停门控用 message 行 completed 字段（禁用 model_usage 完成行）、mac 平台差异（burst 即信号/files 扣除反噬/进程识别口径/FFI 偏移断言/退出兜底/延迟落盘宽限）、SQLite WAL 锁与长期运行防抖（busy_timeout/query_only/扫描 buffer 复用/session_pid 淘汰）、更新功能与 CI 产物命名/版本号三处同步的耦合、多任务并发实时链路（门控全量会话/进程集合聚合/归属迟滞+并发去重——同一 ZCode 窗口新开任务复用同一 app-server 进程、跨项目才分进程/求和口径——文件增量只扣一次、时长只计一次）、网络字节平台原语限制（socket 不进进程 IO 计数/ESTATS 已坏/32 位接口计数逐接口模差/缓存命中不重发——按进程直测无公开原语，netio 分层口径）、窗口控制平台原生化与多屏安全最大化、mac 全屏只信官方身份与默认行为——共 16 条，每条含事故案例与守护措施。
 
 ## 约定
 
@@ -61,7 +60,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 - 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（六档：0–40 绿 / 40–80 黄绿 / 80–160 黄 / 160–240 橙 / 240–320 红 / 320+ 品红，整弧换色不分段，背景轨道恒灰），主表、迷你仪表、"上轮"角标小表（`BadgeGauge`）与胶囊/桌宠的上轮读数共用（`speedColor()` 统一取色）；浮动窗口尺寸改动须同步 `main.rs` 的 `FLOAT_*_SIZE`、`docs/features.md` 与 README。桌宠窗口为"正方形精灵区 + 顶部 `PET_BUBBLE_RESERVE` 气泡预留带"，多任务（≥2 进程，3 拍防抖）期间再向上加高 `PET_TASK_EXTRA`——尺寸口径分布在 `apply_mode`/`set_float_size`/`apply_pet_size` 三处（`pet.ts` 按画布短边定位精灵区），改其一须同步其余；气泡向上生长、精灵不缩小。
 - CI 不随推送自动触发（省机时）：出包走 `v*` 标签（自动发 Release：Windows exe + macOS 双架构 dmg）或 Actions 页手动 Run workflow（Artifacts：windows / macos-x86_64-apple-darwin / macos-aarch64-apple-darwin）；改动 workflow 触发逻辑须同步 README 与 `docs/features.md`。**发版 = 三处版本号同步 bump（`tauri.conf.json` 权威 / `Cargo.toml` / `package.json`）+ `v*` 标签**——应用内更新按 Release 资产名后缀匹配安装包，build.yml 产物命名与 `updater::pick_asset` 是同一协议，改其一须同步另一个（key-rules #12）。
 - 完整面板与悬浮窗位置各自独立记忆（`~/.zcode/speed-panel-mode.txt`）；悬浮窗尺寸用逻辑像素，物理换算走 `scale_factor()`，多屏定位必须 `clamp_to_screen`。
-- 完整面板模块显隐与排序在顶栏 ⚙ 设置（localStorage `modules.v1`；默认显示仪表盘/网速监控/曲线，**快照防护卡默认隐藏**）。每模块包一层 `.module-wrap[data-module]`（`display:contents`，卡片仍是 main 的 flex 项）——**新增面板模块须同步**：index.html 加包装层 + main.ts 的 `MODULE_DEFS`/`MODULES_DEFAULT_ORDER`/`MODULES_DEFAULT_HIDDEN`，详见 features.md「模块显隐与排序」。
+- 完整面板模块显隐与排序在顶栏 ⚙ 设置（localStorage `modules.v1`；默认仪表盘/网速监控/曲线全部显示）。每模块包一层 `.module-wrap[data-module]`（`display:contents`，卡片仍是 main 的 flex 项）——**新增面板模块须同步**：index.html 加包装层 + main.ts 的 `MODULE_DEFS`/`MODULES_DEFAULT_ORDER`/`MODULES_DEFAULT_HIDDEN`，详见 features.md「模块显隐与排序」。
 - 自动启动状态**不落本地配置文件**：Windows 注册表 `HKCU\…\Run` / macOS LaunchAgent plist 即唯一事实源，设置界面回读真实状态（手改注册表、删 plist 如实反映），不在 `speed-panel-*.txt` 里另存一份——避免两处状态漂移。平台差异集中在 `autostart.rs` 的 `#[cfg]` 分支，mac 分支未实机验证（见 features.md「自动启动」）。
 
 ## 文档索引（按需阅读）
