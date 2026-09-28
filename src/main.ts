@@ -1280,31 +1280,30 @@ trayHint.addEventListener("click", () => {
 });
 
 // 顶栏/悬浮窗拖动：mousedown 调 startDragging（按钮、下拉框除外）。
-// 目标自身带 data-tauri-drag-region 时由 Tauri 内核直接处理（跳过，避免双重拖动）
-function enableDrag(el: HTMLElement) {
+// 目标自身带 data-tauri-drag-region 时由 Tauri 内核直接处理（跳过，避免双重拖动）。
+// 双击必须在 detail>=2 的 mousedown 上直接触发、不能绑 DOM dblclick：
+// 第一下的 startDragging 进入 Windows 原生拖动循环吞掉鼠标序列，mouseup 靠
+// WM_EXITSIZEMOVE 补发，两对完整 click 湊不齐 → dblclick 永不触发（gauge/pill
+// 旧绑定因此一直静默失效）。Tauri 内核 drag.js 的双击最大化也是 detail===2 直调 IPC。
+function enableDrag(el: HTMLElement, onDoubleClick?: () => void) {
   el.addEventListener("mousedown", (e) => {
     const target = e.target as HTMLElement;
     if (target.closest("button, select, input, .dropdown")) return;
     if (target.hasAttribute("data-tauri-drag-region")) return;
     e.preventDefault();
+    if (onDoubleClick && e.detail >= 2) {
+      onDoubleClick();
+      return;
+    }
     import("@tauri-apps/api/window")
       .then(({ getCurrentWindow: g }) => g().startDragging().catch(() => {}))
       .catch(() => {});
   });
 }
 enableDrag($("app-header"));
-enableDrag($("float-gauge"));
-enableDrag($("float-pill"));
-enableDrag($("float-pet"));
-
-// 悬浮窗双击 = 恢复完整面板（仪表 / 胶囊 / 桌宠一致）。桌宠换宠物只走 🔄 按钮。
-// 按钮上的双击不触发（click 已处理）
-for (const id of ["float-gauge", "float-pill", "float-pet"]) {
-  $(id).addEventListener("dblclick", (e) => {
-    if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
-    requestMode("full");
-  });
-}
+enableDrag($("float-gauge"), () => requestMode("full"));
+enableDrag($("float-pill"), () => requestMode("full"));
+enableDrag($("float-pet"), () => requestMode("full"));
 
 // ---- 自绘标题栏：拖动移动、双击最大化，— / ▢ / ✕ 窗口控制 ----
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());

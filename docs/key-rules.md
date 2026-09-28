@@ -82,6 +82,7 @@
 
 - **外观原生化**：macOS 标志性的红黄绿交通灯位于顶栏最左侧（左起：红 `#ff5f56` 折叠悬浮窗、黄 `#ffbd2e` 最小化、绿 `#27c93f` 最大化），悬停显现微小符号（`✕`、`—`、`▢`）；Windows 环境保持右侧 `— ▢ ✕` 自绘按钮不变。前端通过 `navigator.userAgent.includes("Mac")` 为 `body` 注入 `platform-mac` class。
 - **副屏最大化防跳屏（`toggle_maximize_safe`）**：无边框窗口（`decorations:false`）在 macOS 下直接调用系统 `toggleMaximize()` 会因为系统 `zoom:` 动作强行跳回主屏。解决方式为 Rust 端 `toggle_maximize_safe`：取窗口中心点所在显示器（`monitor_from_point`），按该显示器物理尺寸铺满（预留顶部系统菜单栏 28pt 避让高度 `(28.0 * scale) as i32`），并在 `AppState.saved_max_rect` 暂存最大化前的物理矩形；再次触发或双击顶栏时还原；在切换到悬浮窗（`switch_mode(Mode::Float)`）时清空暂存，保证状态干净。
+- **DOM `dblclick` 与 `startDragging` 互斥（2026-09-28 事故：悬浮窗双击恢复自上线起静默失效两周）**：enableDrag 在 mousedown 调 `startDragging()`，Windows 上进入原生拖动循环吞掉鼠标序列，mouseup 由 tao 在 `WM_EXITSIZEMOVE` 才补发——两对完整 click 湊不齐，DOM `dblclick` 永不触发（9-17 上线的仪表/胶囊双击恢复因此从未生效，加桌宠双击才暴露）。双击类交互必须学 Tauri 内核 `drag.js` 的做法：在 `e.detail>=2` 的 mousedown 上直调命令（内核对 drag region 的双击最大化正是 detail 2 → `internal_toggle_maximize`；本项目悬浮窗为 detail ≥2 → `set_mode full`），该分支同时跳过 startDragging。连击计数按 mousedown 递增、不依赖前一 mouseup 已派发，detail===2 在拖动循环后仍可靠到达（内核双击最大化即依赖此）。
 
 ## 13. 应用内更新：CI 产物命名即匹配协议，且失效是静默的
 
