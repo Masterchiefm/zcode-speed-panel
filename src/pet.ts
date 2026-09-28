@@ -152,17 +152,10 @@ export class PetWidget {
   private expandBtn: HTMLElement | null = null;
   private cycleBtn: HTMLElement | null = null;
 
-  constructor(canvas: HTMLCanvasElement, packId: string, onPackSwitch?: () => void) {
+  constructor(canvas: HTMLCanvasElement, packId: string) {
     this.canvas = canvas;
     this.pack = packById(packId);
     this.load();
-    // 双击切换下一只宠物
-    canvas.addEventListener("dblclick", () => {
-      const i = PET_PACKS.findIndex((p) => p.id === this.pack.id);
-      this.pack = packById(PET_PACKS[(i + 1) % PET_PACKS.length].id);
-      this.load();
-      onPackSwitch?.();
-    });
     // 悬停监听挂在整块悬浮窗上（按钮是画布兄弟节点，挂画布会在移到按钮上时误判离开）
     const hoverTarget = canvas.parentElement ?? canvas;
     hoverTarget.addEventListener("mouseenter", () => {
@@ -241,10 +234,6 @@ export class PetWidget {
   /** 常显上轮均速（右键菜单勾选项，持久化由调用方处理） */
   setAlwaysLast(on: boolean) {
     this.alwaysLast = on;
-  }
-
-  get packId(): string {
-    return this.pack.id;
   }
 
   /** 切换到下一只宠物（自动保存由调用方处理） */

@@ -73,10 +73,7 @@ const miniLast = new BadgeGauge($("mini-last"), { tiers: SPEED_TIERS });
 // 存储键升级到 v2：让老用户也拿到一次新默认（鲸鱼女仆），之后的选择照常记住
 const PET_PACK_KEY = "petPack.v2";
 let currentPetPack = localStorage.getItem(PET_PACK_KEY) ?? "maid-deepseek-whale";
-const petWidget = new PetWidget($<HTMLCanvasElement>("pet-canvas"), currentPetPack, () => {
-  currentPetPack = petWidget.packId;
-  localStorage.setItem(PET_PACK_KEY, currentPetPack);
-});
+const petWidget = new PetWidget($<HTMLCanvasElement>("pet-canvas"), currentPetPack);
 petWidget.start();
 
 // ---- 桌宠滚轮缩放：上下滚动调整悬浮窗大小（后端记忆，重启后保持） ----
@@ -1300,9 +1297,9 @@ enableDrag($("float-gauge"));
 enableDrag($("float-pill"));
 enableDrag($("float-pet"));
 
-// 悬浮窗双击 = 恢复完整面板。桌宠不参与：双击已用于换宠物（pet.ts），
-// 其恢复走 ⤢ 按钮 / 右键菜单 / 托盘。按钮上的双击不触发（click 已处理）
-for (const id of ["float-gauge", "float-pill"]) {
+// 悬浮窗双击 = 恢复完整面板（仪表 / 胶囊 / 桌宠一致）。桌宠换宠物只走 🔄 按钮。
+// 按钮上的双击不触发（click 已处理）
+for (const id of ["float-gauge", "float-pill", "float-pet"]) {
   $(id).addEventListener("dblclick", (e) => {
     if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
     requestMode("full");
