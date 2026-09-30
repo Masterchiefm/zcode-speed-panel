@@ -208,6 +208,10 @@ cd src-tauri && cargo test
 
 Tauri 2（Rust 后端：usage 数据库轮询 + 进程 IO 实测 + 网络接口计数与 TCP 连接归属 + 托盘）、原生 Canvas 绘制仪表盘与桌宠（无图表库依赖）、Vite + TypeScript。
 
+## 相关项目
+
+**也在用 DeepSeek Harness（DSH）？** 同作者给它做了一个定位相同的插件：[dsh-realtime-tps-pet](https://github.com/Masterchiefm/dsh-realtime-tps-pet)（MIT）——DSH 的实时输出速度悬浮窗，同样有**桌宠**（默认小肥鱼，另有月薪喵与矢量绘制的小机器人）、**环形仪表**与**速度胶囊**三种形态，六档分档配色，整会话 / 上轮 / 上步三种均速口径（与 DSH 内置 sessionStats 同口径），滚轮缩放（0.6×–2×）、可拖动，形态与位置持久化。安装：把仓库链接粘贴给 DSH 让它代为安装，或在「设置 → 插件」通过 URL 安装，也可命令行执行 `dsh plugin install https://github.com/masterchiefm/dsh-realtime-tps-pet`（需 DSH ≥ 0.2.0-rc.2，装完重启 DSH 生效；插件只是会话流式事件的只读视图，无需 API key）。
+
 ## 致谢
 
 - [zcode-tps-monitor](https://github.com/shy3130/zcode-tps-monitor)（MIT）：本项目速率定义借鉴其纯生成时长口径（first_token_at 起点、思考 token 计入分子）
